@@ -94,7 +94,7 @@ class RBM(NervanaObject):
             if 'states' in ps:
                 l.set_states(ps['states'])
 
-    def fit(self, dataset, cost, optimizer, num_epochs, callbacks):
+    def fit(self, dataset, optimizer, num_epochs, callbacks):
         """
         Trains the model parameters on a dataset by minimizing the cost function through
         gradient descent and updates the layer weights according to a learning rule
@@ -117,7 +117,6 @@ class RBM(NervanaObject):
             num_epochs: Number of times to iterate over the dataset.
         """
 
-        self.cost = cost
         self.set_shortcut()  # infer if bprop shortcut can be used
         self.optimizer = optimizer
         self.total_cost = self.be.empty((1, 1))
@@ -158,7 +157,6 @@ class RBM(NervanaObject):
 
         callbacks.on_train_end()
 
-
     def _epoch_fit(self, dataset, callbacks):
         """
         Helper function for fit which performs training on a dataset for one epoch.
@@ -176,11 +174,10 @@ class RBM(NervanaObject):
         sparse_cost = self.optimizer['sparse_cost']
         sparse_target = self.optimizer['sparse_target']
 
-        reconstruction_errors = []
-        Pseudolikelihood = []
         # iterate through minibatches of the dataset
         for mb_idx, (x, t) in enumerate(dataset):
-
+            import time
+            t = time.time()
             callbacks.on_minibatch_begin(epoch, mb_idx)
 
             # TODO: implement schedule
@@ -190,12 +187,12 @@ class RBM(NervanaObject):
 
             for l in self.layers_to_optimize:
                 # this part for sparsity
-                update_W, update_b_hidden, update_b_visible = l.update(x, t, **self.update_params)
+                update = l.update(x, **self.update_params)
 
-                l.dW[:] = momentum * l.dW + lr * (update_W - weight_decay * l.W)
+                l.dW[:] = momentum * l.dW + lr * (update['W'] - weight_decay * l.W)
                 # TODO: check this. Maybe division by n_visible is not correct.
-                l.db_hidden[:] = momentum * l.db_hidden + lr * update_b_hidden
-                l.db_visible[:] = momentum * l.db_visible + lr * update_b_visible # / l.n_visible
+                l.db_hidden[:] = momentum * l.db_hidden + lr * update['b_hidden']
+                l.db_visible[:] = momentum * l.db_visible + lr * update['b_visible'] # / l.n_visible
 
                 l.W[:] = l.W + l.dW
                 l.b_visible[:] = l.b_visible + l.db_visible
@@ -203,20 +200,17 @@ class RBM(NervanaObject):
 
                 #update fast weights
                 if self.optimizer['use_fast_weights']:
-                    l.fast_dW[:] = momentum * l.fast_dW + lr * (update_W - weight_decay * l.W)
-                    l.fast_db_visible = momentum * l.fast_db_visible + lr * update_b_visible
-                    l.fast_db_hidden = momentum * l.fast_db_hidden + lr * update_b_hidden
+                    l.fast_dW[:] = momentum * l.fast_dW + lr * (update['W'] - weight_decay * l.W)
+                    l.fast_db_visible = momentum * l.fast_db_visible + lr * update['b_visible']
+                    l.fast_db_hidden = momentum * l.fast_db_hidden + lr * update['b_hidden']
 
                     l.fast_W[:] = 19.0 / 20 * l.fast_W + l.fast_dW
                     l.fast_db_visible = 19.0 / 20 * l.fast_b_visible + l.fast_db_visible
                     l.fast_db_hidden = 19.0 / 20 * l.fast_b_hidden + l.fast_db_hidden
 
+            t = time.time() - t
+            print "Time for one iteration: ", t
             callbacks.on_minibatch_end(epoch, mb_idx)
-
-
-        print "Reconstruction error: ", np.mean(reconstruction_errors)
-        # print "Pseudolikelihood: ", np.mean(Pseudolikelihood)
-
 
     def fprop(self, x, labels=None):
         """

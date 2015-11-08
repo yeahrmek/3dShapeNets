@@ -354,7 +354,10 @@ class RBMLayer(ParameterLayer):
         update_b_visible = self.be.mean(v_pos - v_neg, axis=-1)
         update_b_hidden = self.be.mean(h_pos - h_neg, axis=-1) - sparsegrads_b_hidden
 
-        return update_W / float(self.be.bsz), update_b_hidden, update_b_visible
+        result = {'W': update_W / float(self.be.bsz),
+                  'b_hidden': update_b_hidden,
+                  'b_visible': update_b_visible}
+        return result
 
     def hidden_probability(self, inputs, labels=None, weights=None):
         """
@@ -675,7 +678,10 @@ class RBMLayerWithLabels(RBMLayer):
         update_b_visible = self.be.mean(v_pos_with_labels - v_neg, axis=-1)
         update_b_hidden = self.be.mean(h_pos - h_neg, axis=-1) - sparsegrads_b_hidden
 
-        return update_W / float(self.be.bsz), update_b_hidden, update_b_visible
+        result = {'W': update_W / float(self.be.bsz),
+                  'b_hidden': update_b_hidden,
+                  'b_visible': update_b_visible}
+        return result
 
 
     def update_for_wake_sleep(self, v_pos, labels=None, persistant=False, kPCD=1):
@@ -774,7 +780,7 @@ class RBMConvolution3D(RBMLayer):
         self.strides = strides
         self.padding = padding
 
-        if isinstance(fshape, tuple):
+        if isinstance(fshape, (tuple, list)):
             fshape = {'T': fshape[0], 'R': fshape[1], 'S': fshape[2], 'K': fshape[3]}
         if isinstance(strides, int):
             strides = {'str_d': strides, 'str_h': strides, 'str_w': strides}
@@ -851,10 +857,12 @@ class RBMConvolution3D(RBMLayer):
         """
         Calculate positive part of grad_W
         """
+        import pdb
+        pdb.set_trace()
         probability = probability.reshape(self.convparams['K'], -1, self.be.bsz)
         result = self.be.empty(self.nglayer_grad_W.dimO2)
         weights = self.be.array(probability.get().transpose([-1, 1, 0])).reshape(-1, self.convparams['K'])
-        self.be.fprop_conv(self.nglayer_grad_W, inputs.T, weights, result)
+        self.be.fprop_conv(self.nglayer_grad_W, inputs.T.reshape(-1, 1), weights, result)
         result = result.reshape(self.convparams['K'], -1).T
         return self.be.divide(result, self.be.bsz, out=result)
 
@@ -938,7 +946,13 @@ class RBMConvolution3D(RBMLayer):
         #TODO: maybe this should be mean(mean(mean(...))) like in crbm.m?
         update_b_hidden = self._update_b_hidden(h_pos - h_neg) - sparsegrads_b_hidden
 
-        return update_W / float(self.be.bsz), update_b_hidden, update_b_visible, zeros_ratio
+        result = {'W': update_W / float(self.be.bsz),
+                  'b_hidden': update_b_hidden,
+                  'b_visible': update_b_visible,
+                  'zeros_ratio': zeros_ratio}
+        import pdb
+        pdb.set_trace()
+        return result
 
     def hidden_probability(self, inputs, weights=None):
         """

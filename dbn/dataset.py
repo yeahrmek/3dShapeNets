@@ -17,7 +17,7 @@ class ModelNetDataset(NervanaObject):
     entire dataset is small enough to fit within memory.
     """
 
-    def __init__(self, path, classes=None, data_size=None, is_train=True, make_onehot=True):
+    def __init__(self, path, classes=None, data_size=None, lshape=None, is_train=True, make_onehot=True):
         """
         Implements loading of given data into backend tensor objects. If the
         backend is specific to an accelarator device, the data is copied over
@@ -66,7 +66,8 @@ class ModelNetDataset(NervanaObject):
 
         # mini-batch sized buffer
         self.Xbuf = self.be.iobuf(data_size**3)
-        self.Xbuf.lshape = [data_size] * 3
+        if not lshape is None:
+            self.Xbuf.lshape = lshape
 
         assert self.ndata > self.be.bsz
 
