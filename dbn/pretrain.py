@@ -19,7 +19,7 @@ path = '../../3DShapeNetsMatlab/volumetric_data'
 classes = ['bathtub', 'bed', 'chair', 'desk']
 
 be = gen_backend(backend='cpu',
-                 batch_size=256,
+                 batch_size=32,
                  rng_seed=0,
                  device_id=0,
                  default_dtype=np.float32)

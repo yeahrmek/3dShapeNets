@@ -14,190 +14,10 @@ from neon.layers.layer import Layer, ParameterLayer, Bias, BatchNorm, Activation
 from neon.transforms import Logistic
 
 
+from conv_layer_grad import ConvLayerGrad, fprop_conv_grad
+
+
 logger = logging.getLogger(__name__)
-
-
-class Convolution3D(ParameterLayer):
-    """
-    Convolutional layer implementation.
-    Works with volumetric data
-
-    Arguments:
-        fshape (tuple(int)): four dimensional shape of convolution window (depth, width, height, n_output_maps)
-        strides (Optional[Union[int, dict]]): strides to apply convolution
-            window over. An int applies to both dimensions, or a dict with
-            str_d, str_h and str_w applies to d, h and w dimensions distinctly.  Defaults
-            to str_d = str_w = str_h = None
-        padding (Optional[Union[int, dict]]): padding to apply to edges of
-            input. An int applies to both dimensions, or a dict with pad_d, pad_h
-            and pad_w applies to h and w dimensions distinctly.  Defaults
-            to pad_d = pad_w = pad_h = None
-        init (Optional[Initializer]): Initializer object to use for
-            initializing layer weights
-        name (Optional[str]): layer name. Defaults to "ConvolutionLayer"
-    """
-
-    def __init__(self, fshape, strides={}, padding={}, init=None, name="ConvolutionLayer"):
-        super(Convolution3D, self).__init__(init, name)
-        self.nglayer = None
-        self.convparams = {'str_h': 1, 'str_w': 1, 'str_d': 1,
-                           'pad_h': 0, 'pad_w': 0, 'pad_d': 0,
-                           }
-
-        # keep around args in __dict__ for get_description.
-        self.fshape = fshape
-        self.strides = strides
-        self.padding = padding
-
-        if isinstance(fshape, tuple):
-            fshape = {'T': fshape[0], 'R': fshape[1], 'S': fshape[2], 'K': fshape[3]}
-        if isinstance(strides, int):
-            strides = {'str_d': strides, 'str_h': strides, 'str_w': strides}
-        if isinstance(padding, int):
-            padding = {'pad_d': padding, 'pad_h': padding, 'pad_w': padding}
-        for d in [fshape, strides, padding]:
-            self.convparams.update(d)
-
-    def init_buffers(self, inputs):
-        """
-        Helper for allocating output and delta buffers (but not initializing
-        them)
-
-        Arguments:
-            inputs (Tensor): tensor used for frop inputs, used to determine
-                shape of buffers being allocated.
-        """
-        self.inputs = inputs
-        if not self.nglayer:
-            assert hasattr(self.inputs, 'lshape')
-            self.convparams['C'] = self.inputs.lshape[0] # n_input_feature_maps
-            self.convparams['D'] = self.inputs.lshape[1] # depth of image
-            self.convparams['H'] = self.inputs.lshape[2] # height of image
-            self.convparams['W'] = self.inputs.lshape[3] # width of image
-            self.convparams['N'] = self.be.bsz # n_images in mini-batch
-            self.nglayer = self.be.conv_layer(self.be.default_dtype, **self.convparams)
-            self.outputs = self.be.iobuf(self.nglayer.nOut, self.outputs)
-            self.outputs.lshape = (self.nglayer.K, self.nglayer.M, self.nglayer.P, self.nglayer.Q)
-            self.deltas = self.be.iobuf(self.inputs.shape[0], self.deltas)
-
-        if self.weight_shape is None:
-            self.weight_shape = self.nglayer.dimF2  # (C * T * R * S, K)
-
-    def fprop(self, inputs, inference=False):
-        super(Convolution3D, self).fprop(inputs)
-        self.be.fprop_conv(self.nglayer, inputs, self.W, self.outputs)
-        return self.outputs
-
-    def bprop(self, error, do_acts=True):
-        if do_acts:
-            self.be.bprop_conv(self.nglayer, self.W, error, self.deltas)
-        self.be.update_conv(self.nglayer, self.inputs, error, self.dW)
-        return self.deltas
-
-
-class Pooling3D(Layer):
-    """
-    Pooling layer implementation.
-
-    Arguments:
-        fshape (Union[int, Tuple[int, int]]): one or three dimensional shape
-            of pooling window
-        op (Optional[str]): pooling operation in [max, avg]. Defaults to "max"
-        strides (Optional[Union[int, dict]]): strides to apply pooling window
-            over. An int applies to both dimensions, or a dict with str_d, str_h
-            and str_w applies to h and w dimensions distinctly.  Defaults
-            to str_d = str_w = str_h = None
-        padding (Optional[Union[int, dict]]): padding to apply to edges of
-            input. An int applies to both dimensions, or a dict with pad_d, pad_h
-            and pad_w applies to h and w dimensions distinctly.  Defaults
-            to pad_d = pad_w = pad_h = None
-        name (Optional[str]): layer name. Defaults to "PoolingLayer"
-    """
-    def __init__(self, fshape, op="max", strides={}, padding={},
-                 name="PoolingLayer"):
-        super(Pooling3D, self).__init__(name)
-        self.poolparams = {'str_h': None, 'str_w': None, 'str_d': None, 'str_j': None,
-                           'pad_h': 0, 'pad_w': 0, 'pad_d': 0, 'pad_j': 0,
-                           'J': 1, 'op': op}  # 3D paramaters
-
-        # keep args around in __dict__ for get_description
-        self.op = op
-        self.fshape = fshape
-        self.strides = strides
-        self.padding = padding
-
-        if isinstance(fshape, int):
-            fshape = {'T': fshape, 'R': fshape, 'S': fshape}
-        elif isinstance(fshape, tuple):
-            fshape = {'T': fshape[0], 'R': fshape[1], 'S': fshape[2]}
-        if isinstance(strides, int):
-            strides = {'str_d': strides, 'str_h': strides, 'str_w': strides}
-        if isinstance(padding, int):
-            padding = {'pad_d': padding, 'pad_h': padding, 'pad_w': padding}
-        for d in [fshape, strides, padding]:
-            self.poolparams.update(d)
-        self.nglayer = None
-
-    def init_buffers(self, inputs):
-        self.inputs = inputs
-        if self.nglayer is None:
-            assert hasattr(self.inputs, 'lshape')
-            self.poolparams['C'] = self.inputs.lshape[0]
-            self.poolparams['D'] = self.inputs.lshape[1]
-            self.poolparams['H'] = self.inputs.lshape[2]
-            self.poolparams['W'] = self.inputs.lshape[3]
-            self.poolparams['N'] = self.be.bsz
-            self.nglayer = self.be.pool_layer(self.be.default_dtype, **self.poolparams)
-            self.outputs = self.be.iobuf(self.nglayer.nOut, self.outputs)
-            self.outputs.lshape = (self.nglayer.K, self.nglayer.P, self.nglayer.Q)
-            self.deltas = self.be.iobuf(self.inputs.shape[0], self.deltas)
-
-    def fprop(self, inputs, inference=False):
-        self.init_buffers(inputs)
-        self.be.fprop_pool(self.nglayer, inputs, self.outputs)
-        return self.outputs
-
-    def bprop(self, error):
-        self.be.bprop_pool(self.nglayer, self.inputs, error, self.deltas)
-        return self.deltas
-
-
-class Conv3D(list):
-    """
-    A convolutional layer with a learned bias and activation, implemented as a
-    list composing separate Convolution, Bias and Activation layers.
-
-    Arguments:
-        fshape (tuple(int)): four dimensional shape of convolution window
-        init (Optional[Initializer]): Initializer object to use for
-            initializing layer weights and bias
-        strides (Optional[Union[int, dict]]): strides to apply convolution
-            window over. An int applies to both dimensions, or a dict with
-            str_d, str_h and str_w applies to h and w dimensions distinctly.
-            Defaults to str_d = str_w = str_h = None
-        pad (Optional[Union[int, dict]]): padding to apply to edges of
-            input. An int applies to both dimensions, or a dict with pad_d, pad_h
-            and pad_w applies to h and w dimensions distinctly.  Defaults
-            to pad_d = pad_w = pad_h = None
-        bias (Initializer): an initializer to use for bias parameters
-        activation (Transform): a transform object with fprop and bprop
-            functions to apply
-        conv_name (str): the name to call the Convolutional layer. Defaults to 'Convolution3DLayer'
-        bias_name (str): the name to call the Bias layer. Defaults to 'BiasLayer'
-        act_name (str): the name to call the Activation layer. Defaults to ActivationLayer.
-
-    """
-    def __init__(self, fshape, init, strides={}, pad={}, bias=None, batch_norm=False,
-                 activation=None, conv_name='Convolution3DLayer',
-                 bias_name='BiasLayer', act_name='ActivationLayer'):
-        list.__init__(self)
-        self.append(Convolution3D(fshape=fshape, strides=strides, padding=pad, init=init))
-        if bias is not None:
-            self.append(Bias(init=bias))
-        if batch_norm:
-            self.append(BatchNorm())
-        if activation is not None:
-            self.append(Activation(transform=activation))
 
 
 class RBMLayer(ParameterLayer):
@@ -831,12 +651,11 @@ class RBMConvolution3D(RBMLayer):
         # conv layer and params for convolving V and P(H|V)
         if not self.nglayer_grad_W:
             self.convparams_grad_W = self.convparams.copy()
-            self.convparams_grad_W['C'] = self.be.bsz
-            self.convparams_grad_W['N'] = 1
+            self.convparams_grad_W['N'] = self.be.bsz
             self.convparams_grad_W['T'] = self.nglayer.M # depth of filter
             self.convparams_grad_W['R'] = self.nglayer.P # height of filter
             self.convparams_grad_W['S'] = self.nglayer.Q # width of filter
-            self.nglayer_grad_W = self.be.conv_layer(self.be.default_dtype, **self.convparams_grad_W)
+            self.nglayer_grad_W = ConvLayerGrad(self.be, self.be.default_dtype, **self.convparams_grad_W)
             # self.visible_preacts = None
             # self.visible_preacts = self.be.iobuf(self.nglayer_grad_W.nOut, self.visible_preacts)
 
@@ -857,13 +676,9 @@ class RBMConvolution3D(RBMLayer):
         """
         Calculate positive part of grad_W
         """
-        import pdb
-        pdb.set_trace()
-        probability = probability.reshape(self.convparams['K'], -1, self.be.bsz)
         result = self.be.empty(self.nglayer_grad_W.dimO2)
-        weights = self.be.array(probability.get().transpose([-1, 1, 0])).reshape(-1, self.convparams['K'])
-        self.be.fprop_conv(self.nglayer_grad_W, inputs.T.reshape(-1, 1), weights, result)
-        result = result.reshape(self.convparams['K'], -1).T
+        #TODO: this should be moved to backend. Currently works only with CPU backend
+        fprop_conv_grad(self.nglayer_grad_W, inputs, probability, result)
         return self.be.divide(result, self.be.bsz, out=result)
 
     def _complex_mean(self, input_array, mean_axes):
@@ -950,8 +765,6 @@ class RBMConvolution3D(RBMLayer):
                   'b_hidden': update_b_hidden,
                   'b_visible': update_b_visible,
                   'zeros_ratio': zeros_ratio}
-        import pdb
-        pdb.set_trace()
         return result
 
     def hidden_probability(self, inputs, weights=None):

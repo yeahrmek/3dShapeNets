@@ -1,7 +1,6 @@
 from neon import NervanaObject
 
 
-import pandas as pd
 import numpy as np
 from scipy.io import loadmat
 
