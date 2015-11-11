@@ -120,6 +120,19 @@ class RBMLayer(ParameterLayer):
                                       self.be.rng.uniform(size=visible_proba.shape))
         return visible_units, visible_proba
 
+    def _grad(self, visible_units, hidden_units):
+        """
+        Calculate positive or negative gradient of weights
+
+        Inputs:
+            visible_units (Tensor): visible units
+            hidden_units (Tensor): hidden_units
+
+        Returns:
+            OPTree.node
+        """
+        return self.be.dot(visible_units, hidden_units.T)
+
     def update(self, v_pos, labels=None, persistant=False, kPCD=1, use_fast_weights=False,
                sparse_target=0, sparse_damping=0, sparse_cost=0, collect_zero_signal=True):
         """
@@ -170,13 +183,16 @@ class RBMLayer(ParameterLayer):
             sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos, sparse_target,
                                                                   sparse_damping, sparse_cost)
 
-        update_W = self.be.dot(v_pos, h_pos.T) - self.be.dot(v_neg, h_neg.T)
+        # update_W = self.be.dot(v_pos, h_pos.T) - self.be.dot(v_neg, h_neg.T)
+        update_W = self._grad(v_pos, h_pos) - self._grad(v_neg, h_neg)
         update_b_visible = self.be.mean(v_pos - v_neg, axis=-1)
         update_b_hidden = self.be.mean(h_pos - h_neg, axis=-1) - sparsegrads_b_hidden
 
         result = {'W': update_W / float(self.be.bsz),
                   'b_hidden': update_b_hidden,
                   'b_visible': update_b_visible}
+        if not collect_zero_signal:
+            result['zero_signal_mask'] = zero_signal_mask
         return result
 
     def hidden_probability(self, inputs, labels=None, weights=None):
@@ -433,7 +449,7 @@ class RBMLayerWithLabels(RBMLayer):
                 In this case it will be converted to OHE labels.
             persistant (bool): whether to use persistant CD
             kPCD (int): number of samples generation during negative phase of CD (CD-k)
-            use_fast_weights (bool): whether to use fast weights CD algorithm for learning. Not implemented yet!
+            use_fast_weights (bool): whether to use fast weights CD algorithm for learning.
             sparse_target (float): desired sparsity
             sparse_damping (float): damping of sparsity parameters
             sparse_cost (float): cost of not matching sparsity target
@@ -494,7 +510,8 @@ class RBMLayerWithLabels(RBMLayer):
             self.chain = self.be.array(h_neg.get() > self.be.rng.uniform(size=h_neg.shape))
 
 
-        update_W = self.be.dot(v_pos_with_labels, h_pos.T) - self.be.dot(v_neg, h_neg.T)
+        # update_W = self.be.dot(v_pos_with_labels, h_pos.T) - self.be.dot(v_neg, h_neg.T)
+        update_W = self._grad(v_pos_with_labels, h_pos) - self._grad(v_neg, h_neg)
         update_b_visible = self.be.mean(v_pos_with_labels - v_neg, axis=-1)
         update_b_hidden = self.be.mean(h_pos - h_neg, axis=-1) - sparsegrads_b_hidden
 
@@ -534,7 +551,8 @@ class RBMLayerWithLabels(RBMLayer):
             self.chain = self.be.array(h_neg.get() > self.be.rng.uniform(size=h_neg.shape))
 
 
-        update_W = self.be.dot(v_pos, h_pos_sample.T) - self.be.dot(v_neg_sample, h_neg.T)
+        # update_W = self.be.dot(v_pos, h_pos_sample.T) - self.be.dot(v_neg_sample, h_neg.T)
+        update_W = self._grad(v_pos, h_pos_sample) - self._grad(v_neg_sample, h_neg)
         update_b_visible = self.be.mean(v_pos - v_neg_sample, axis=-1)
         update_b_hidden = self.be.mean(h_pos_sample - h_neg, axis=-1)
 
@@ -609,6 +627,8 @@ class RBMConvolution3D(RBMLayer):
         for d in [fshape, strides, padding]:
             self.convparams.update(d)
 
+        self.n_hidden_units = fshape['T'] * fshape['R'] * fshape['S']
+
     def init_buffers(self, inputs):
         """
         Helper for allocating output and delta buffers (but not initializing
@@ -672,13 +692,17 @@ class RBMConvolution3D(RBMLayer):
             # b in Matlab code
             self.b_hid_shape = (self.convparams['K'], 1) # K x 1 x 1 x 1 - number of output feature maps
 
-    def _conv_inputs_proba(self, inputs, probability):
+    def _grad(self, visible_units, hidden_units):
         """
         Calculate positive part of grad_W
+
+        Inputs:
+            visible_units (Tensor): visible units
+            hidden_units (Tensor): hidden units (or their probabilities)
         """
         result = self.be.empty(self.nglayer_grad_W.dimO2)
         #TODO: this should be moved to backend. Currently works only with CPU backend
-        fprop_conv_grad(self.nglayer_grad_W, inputs, probability, result)
+        fprop_conv_grad(self.nglayer_grad_W, visible_units, hidden_units, result)
         return self.be.divide(result, self.be.bsz, out=result)
 
     def _complex_mean(self, input_array, mean_axes):
@@ -755,7 +779,7 @@ class RBMConvolution3D(RBMLayer):
                                                                   sparse_damping, sparse_cost)
             zeros_ratio = 1
 
-        update_W = self._conv_inputs_proba(v_pos, h_pos) - self._conv_inputs_proba(v_neg, h_neg)
+        update_W = self._conv_grad(v_pos, h_pos) - self._conv_inputs_proba(v_neg, h_neg)
         update_b_visible = self.be.mean(v_pos - v_neg, axis=-1)
 
         #TODO: maybe this should be mean(mean(mean(...))) like in crbm.m?

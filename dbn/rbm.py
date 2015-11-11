@@ -142,7 +142,6 @@ class RBM(NervanaObject):
                               'sparse_damping': self.optimizer['sparse_damping'],
                               'collect_zero_signal': self.optimizer['collect_zero_signal']}
 
-
         callbacks.on_train_begin(num_epochs)
 
         while self.epoch_index < num_epochs and not self.finished:
@@ -176,8 +175,7 @@ class RBM(NervanaObject):
 
         # iterate through minibatches of the dataset
         for mb_idx, (x, t) in enumerate(dataset):
-            import time
-            t = time.time()
+
             callbacks.on_minibatch_begin(epoch, mb_idx)
 
             # TODO: implement schedule
@@ -208,8 +206,6 @@ class RBM(NervanaObject):
                     l.fast_db_visible = 19.0 / 20 * l.fast_b_visible + l.fast_db_visible
                     l.fast_db_hidden = 19.0 / 20 * l.fast_b_hidden + l.fast_db_hidden
 
-            t = time.time() - t
-            print "Time for one iteration: ", t
             callbacks.on_minibatch_end(epoch, mb_idx)
 
     def fprop(self, x, labels=None):
@@ -437,46 +433,26 @@ class RBM(NervanaObject):
             layers_to_optimize[-1].b_hidden[:] = layers_to_optimize[-1].b_hidden + layers_to_optimize[-1].db_hidden
             layers_to_optimize[-1].b_visible[:] = layers_to_optimize[-1].b_visible + layers_to_optimize[-1].db_visible
 
-            # for i, l in enumerate(layers_to_optimize[:-1]):
-                # l.dDW[:] = momentum * l.dDW + lr *
 
-        #     # generative weight
-        # for l = 2 : num_layer - 1
-        #     if l == 2
-        #         model.layers{l}.grddw = momentum * model.layers{l}.grddw +
-        #         lr * prod(model.layers{l}.layerSize(1:3)) *
-        #         myConvolve(kConv_weight, wake_states{l-1} - p_gen{l-1}, wake_states{l}, model.layers{l}.stride, 'weight');
-        #         model.layers{l}.grdb = momentum * model.layers{l}.grdb + lr * squeeze(mean(wake_states{l-1} - p_gen{l-1},1));
-        #         model.layers{l}.dw = model.layers{l}.dw + model.layers{l}.grddw;
-        #         model.layers{l}.b = model.layers{l}.b + model.layers{l}.grdb;
-        #     elseif strcmp(model.layers{l}.type, 'convolution')
-        #         model.layers{l}.grddw = momentum * model.layers{l}.grddw + lr * prod(model.layers{l}.layerSize(1:3)) * myConvolve(kConv_weight_c, wake_states{l-1} - p_gen{l-1}, wake_states{l}, model.layers{l}.stride, 'weight');
-        #         model.layers{l}.grdb = momentum * model.layers{l}.grdb + lr * squeeze(mean(wake_states{l-1} - p_gen{l-1},1));
-        #         model.layers{l}.dw = model.layers{l}.dw + model.layers{l}.grddw;
-        #         model.layers{l}.b = model.layers{l}.b + model.layers{l}.grdb;
-        #     else
-        #         wake_states{l-1} = reshape(wake_states{l-1}, batch_size, []);
-        #         p_gen{l-1} = reshape(p_gen{l-1}, batch_size, []);
-        #         model.layers{l}.grddw = momentum * model.layers{l}.grddw + lr * (wake_states{l-1} - p_gen{l-1})' * wake_states{l} ./ batch_size;
-        #         model.layers{l}.grdb = momentum * model.layers{l}.grdb + lr * mean(wake_states{l-1} - p_gen{l-1}, 1);
-        #         model.layers{l}.dw = model.layers{l}.dw + model.layers{l}.grddw;
-        #         model.layers{l}.b = model.layers{l}.b + model.layers{l}.grdb;
-        #     end
-        # end
+            #TODO: it looks like convolution in Matlab kConv_weights divides
+            # the result by the batch size and by the size of filter. Check this and make corresponding fix
+            # in the code below. Also, don't forget to review code of rbm_layer.py
 
-
-            for l in self.layers_to_optimize:
-                # this part for sparsity
-                update_W, update_b_hidden, update_b_visible = l.update(x, t, **self.update_params)
-
-                l.dW[:] = momentum * l.dW + lr * (update_W - weight_decay * l.W)
-                # TODO: check this. Maybe division by n_visible is not correct.
-                l.db_hidden[:] = momentum * l.db_hidden + lr * update_b_hidden
-                l.db_visible[:] = momentum * l.db_visible + lr * (update_b_visible) # / l.n_visible
-
-                l.W[:] = l.W + l.dW
+            #generative weights
+            for i, l in enumerate(layers_to_optimize[:-1]):
+                l.dDW[:] = momentum * l.dDW + lr * l.n_hidden_units * \
+                           l._grad(wake_states[i] - p_gen[i], wake_states[i + 1]) / l.be.bsz
+                l.db_visible[:] = momentum * l.db_visible + lr * self.be.mean(wake_states[i] - p_gen[i], axis=-1)
+                l.dW[:] = l.dW + l.dDW
                 l.b_visible[:] = l.b_visible + l.db_visible
-                l.b_hidden[:] = l.b_hidden + l.db_hidden
+
+            #recognition weights
+            for i, l in enumerate(layers_to_optimize[:-1]):
+                l.dUW[:] = momentum * l.dUW + lr * l.n_hidden_units * \
+                           l._grad(sleep_activations[i], sleep_states[i + 1] - p_rec[i]) / l.be.bsz
+                l.db_visible[:] = momentum * l.db_visible + lr * self.be.mean(wake_states[i] - p_gen[i], axis=-1)
+                l.dW[:] = l.dW + l.dDW
+                l.b_visible[:] = l.b_visible + l.db_visible
 
             callbacks.on_minibatch_end(epoch, mb_idx)
 
