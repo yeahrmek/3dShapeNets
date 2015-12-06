@@ -15,14 +15,14 @@
 
 import numpy as np
 
-from neon import NervanaObject
+
 from neon.transforms import CrossEntropyBinary, Logistic
 from neon.util.persist import load_obj
-from neon.layers import Merge, Activation
 from neon.data import DataIterator
+from neon.models.model import Model
 
 
-class RBM(NervanaObject):
+class RBM(Model):
     """
     Restricted Boltzman Machine class.
 
@@ -36,63 +36,6 @@ class RBM(NervanaObject):
         optimizer (Optimizer): Optimizer object which defines the learning rule
                                for updating model parameters (ie DescentMomentum, AdaDelta)
     """
-
-    def __init__(self, layers=[], name="model", optimizer=None):
-        super(RBM, self).__init__(name)
-        self.optimizer = optimizer
-        self.params = None
-        self.states = None
-        self.epoch_index = 0
-        self.ws_epoch_index = 0
-        self.finished = False
-
-        self.layers = []
-        self.layers_to_optimize = []
-
-        for layer in layers:
-            if isinstance(layer, list):
-                self.layers.extend(layer)
-            else:
-                self.layers.append(layer)
-
-        for layer in self.layers:
-            if layer.has_params:
-                self.layers_to_optimize.append(layer)
-
-            elif isinstance(layer, Merge):
-                self.layers_to_optimize += layer.layers_to_optimize
-
-    def set_shortcut(self):
-        # infer whether bprop shortcut can be used on final activation
-        # self.cost should be set to run this otherwise do nothing
-        lastlayer = self.layers[-1]
-        try:
-            if self.cost.costfunc.__class__ is CrossEntropyBinary:
-                if (lastlayer.__class__ is Activation and
-                   lastlayer.transform.__class__ is Logistic):
-                    lastlayer.transform.set_shortcut(True)
-        except:
-            # if any attributes are not set or any other exception
-            # is thrown leave transform.shortcut as is (do nothing)
-            pass
-
-    def load_weights(self, weight_path):
-        """
-        Loads the layer weights saved in weight_path from serialize().
-
-        Arguments:
-            weight_path (str): File containing serialized python dict with layer
-                               weights and states.
-        """
-        pdict = load_obj(weight_path)
-        self.epoch_index = pdict['epoch_index']
-
-        param_layers = [l for l in self.layers_to_optimize]
-        param_dict_list = pdict['layer_params_states']
-        for l, ps in zip(param_layers, param_dict_list):
-            l.set_params(ps['params'])
-            if 'states' in ps:
-                l.set_states(ps['states'])
 
     def fit(self, dataset, optimizer, num_epochs, callbacks):
         """
@@ -117,10 +60,18 @@ class RBM(NervanaObject):
             num_epochs: Number of times to iterate over the dataset.
         """
 
-        self.set_shortcut()  # infer if bprop shortcut can be used
-        self.optimizer = optimizer
-        self.total_cost = self.be.empty((1, 1))
+        if isinstance(num_epochs, int):
+            num_epochs = [num_epochs] * len(self.layers.layers_to_optimize)
         self.num_epochs = num_epochs
+
+        self.optimizer = optimizer
+
+        from neon.layers import GeneralizedCost
+        from neon.transforms.cost import SumSquared
+        self.cost = GeneralizedCost(costfunc=SumSquared())
+
+        self.initialize(dataset, self.cost)
+        self.total_cost = self.be.empty((1, 1))
 
         if not 'persistant' in self.optimizer:
             self.optimizer['persistant'] = False
@@ -142,17 +93,26 @@ class RBM(NervanaObject):
                               'sparse_damping': self.optimizer['sparse_damping'],
                               'collect_zero_signal': self.optimizer['collect_zero_signal']}
 
-        callbacks.on_train_begin(num_epochs)
 
-        while self.epoch_index < num_epochs and not self.finished:
 
-            callbacks.on_epoch_begin(self.epoch_index)
+        self.layer_being_trained = 0
 
-            self._epoch_fit(dataset, callbacks)
+        callbacks.on_train_begin(num_epochs[0])
 
-            callbacks.on_epoch_end(self.epoch_index)
+        for i in xrange(len(self.layers.layers_to_optimize)):
 
-            self.epoch_index += 1
+            while self.epoch_index < num_epochs[i] and not self.finished:
+
+                callbacks.on_epoch_begin(self.epoch_index)
+
+                self._epoch_fit(dataset, callbacks)
+
+                callbacks.on_epoch_end(self.epoch_index)
+
+                self.epoch_index += 1
+
+            self.epoch_index = 0
+            self.layer_being_trained += 1
 
         callbacks.on_train_end()
 
@@ -164,9 +124,8 @@ class RBM(NervanaObject):
             dataset (iterable): Dataset iterator to perform fit on
         """
         epoch = self.epoch_index
-        self.total_cost[:] = 0
-        print "current implementation trains only one layer. Create model for each layer separately, and then stack them"
 
+        #TODO: implement using Optimizer
         lr = self.optimizer['learning_rate']
         weight_decay = self.optimizer['weight_decay']
         sparse_damping = self.optimizer['sparse_damping']
@@ -178,71 +137,38 @@ class RBM(NervanaObject):
 
             callbacks.on_minibatch_begin(epoch, mb_idx)
 
+            x = self.fprop(x, fprop_to_layer=self.layer_being_trained)
+
             # TODO: implement schedule
             momentum = self.optimizer['momentum'][-1]
             if self.epoch_index < self.num_epochs * self.optimizer['step_config']:
                 momentum = self.optimizer['momentum'][0]
 
-            for l in self.layers_to_optimize:
-                # this part for sparsity
-                update = l.update(x, **self.update_params)
+            layer = self.layers.layers_to_optimize[self.layer_being_trained]
 
-                l.dW[:] = momentum * l.dW + lr * (update['W'] - weight_decay * l.W)
-                # TODO: check this. Maybe division by n_visible is not correct.
-                l.db_hidden[:] = momentum * l.db_hidden + lr * update['b_hidden']
-                l.db_visible[:] = momentum * l.db_visible + lr * update['b_visible'] # / l.n_visible
+            # this part for sparsity
+            update = layer.update(x, labels=t, **self.update_params)
 
-                l.W[:] = l.W + l.dW
-                l.b_visible[:] = l.b_visible + l.db_visible
-                l.b_hidden[:] = l.b_hidden + l.db_hidden
+            layer.dW[:] = momentum * layer.dW + lr * (update['W'] - weight_decay * layer.W)
+            # TODO: check this. Maybe division by n_visible is not correct.
+            layer.db_hidden[:] = momentum * layer.db_hidden + lr * update['b_hidden']
+            layer.db_visible[:] = momentum * layer.db_visible + lr * update['b_visible'] # / layer.n_visible
 
-                #update fast weights
-                if self.optimizer['use_fast_weights']:
-                    l.fast_dW[:] = momentum * l.fast_dW + lr * (update['W'] - weight_decay * l.W)
-                    l.fast_db_visible = momentum * l.fast_db_visible + lr * update['b_visible']
-                    l.fast_db_hidden = momentum * l.fast_db_hidden + lr * update['b_hidden']
+            layer.W[:] = layer.W + layer.dW
+            layer.b_visible[:] = layer.b_visible + layer.db_visible
+            layer.b_hidden[:] = layer.b_hidden + layer.db_hidden
 
-                    l.fast_W[:] = 19.0 / 20 * l.fast_W + l.fast_dW
-                    l.fast_db_visible = 19.0 / 20 * l.fast_b_visible + l.fast_db_visible
-                    l.fast_db_hidden = 19.0 / 20 * l.fast_b_hidden + l.fast_db_hidden
+            #update fast weights
+            if self.optimizer['use_fast_weights']:
+                layer.fast_dW[:] = momentum * layer.fast_dW + lr * (update['W'] - weight_decay * layer.W)
+                layer.fast_db_visible[:] = momentum * layer.fast_db_visible + lr * update['b_visible']
+                layer.fast_db_hidden[:] = momentum * layer.fast_db_hidden + lr * update['b_hidden']
+
+                layer.fast_W[:] = 19.0 / 20 * layer.fast_W + layer.fast_dW
+                layer.fast_db_visible[:] = 19.0 / 20 * layer.fast_b_visible + layer.fast_db_visible
+                layer.fast_db_hidden[:] = 19.0 / 20 * layer.fast_b_hidden + layer.fast_db_hidden
 
             callbacks.on_minibatch_end(epoch, mb_idx)
-
-    def fprop(self, x, labels=None):
-        """
-        Forward propagates a minibatch x through the model.
-
-        Arguments:
-            x (Tensor): Input minibatch data
-            pos_stat (bool): Flag for collecting positiva statistics.
-                If set to True returns hidden probability of the last layer
-        Returns:
-            Tensor: the output of the final layer in the model
-        """
-        for l in self.layers:
-            x, proba = l.fprop(x, labels)
-        return x, proba
-
-    def bprop(self, hidden_units, do_acts=True, neg_stat=False, neg_stat_params=None):
-        """
-        Back propagates the error of a minibatch through the model.
-
-        Arguments:
-            hidden_units (Tensor): Hidden units
-            do_acts (bool): Whether to compute the output deltas of layer. The first layer
-                does not need to compute output deltas and so do_acts is set to False.
-            neg_stat (bool): Whether to collect negative statistics.
-                If set to True returns visible probability of the last layer
-        """
-        if neg_stat:
-            if neg_stat_params is None:
-                neg_stat_params = {}
-            return self.layers[-1].neg_stat(**neg_stat_params)
-
-        x_reconstructed = hidden_units
-        for l in reversed(self.layers):
-            x_reconstructed = l.bprop(x_reconstructed)
-        return x_reconstructed
 
     def eval(self, dataset, metric):
         """
@@ -278,12 +204,37 @@ class RBM(NervanaObject):
 
         return np.array(prediction)
 
+    def fprop(self, x, inference=False, labels=None, fprop_to_layer=None):
+        """
+        Forward propagates a minibatch x through the model.
+
+        Arguments:
+            x (Tensor): Input minibatch data
+            inference (bool): Flag for performing training or inference
+                Only affects batch norm and dropout layers.
+
+        Returns:
+            Tensor: the output of the final layer in the model
+        """
+        hidden_units = x
+        if fprop_to_layer is None:
+            fprop_to_layer = len(self.layers.layers)
+
+        for l in self.layers.layers[:fprop_to_layer]:
+            hidden_units = l.fprop(hidden_units, inference=inference, labels=labels)
+
+        return hidden_units
+
     def gibbs_sampling(self, inputs):
         """
         Perform Gibbs sampling
         """
-        hidden, _ = self.fprop(inputs)
-        visible, _ = self.bprop(hidden)
+        hidden = self.fprop(inputs)
+        hidden = self.be.array(hidden.get() > self.be.rng.uniform(size=hidden.shape))
+        #TOOD: make correct bprop
+        visible_optree = self.layers.layers[0].sample_visibles(hidden)
+        visible = self.be.empty(visible_optree.shape)
+        visible._assign(visible_optree)
         return visible
 
     def get_description(self):

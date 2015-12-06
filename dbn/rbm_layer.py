@@ -9,15 +9,20 @@ import numpy as np
 
 
 from neon import NervanaObject
-from neon.backends import Autodiff
-from neon.layers.layer import Layer, ParameterLayer, Bias, BatchNorm, Activation
+from neon.layers.layer import ParameterLayer, Convolution
 from neon.transforms import Logistic
 
 
-from conv_layer_grad import ConvLayerGrad, fprop_conv_grad
-
-
 logger = logging.getLogger(__name__)
+
+
+def _calc_optree(optree, be):
+    """
+    Calculate operation tree and return result as Tensor
+    """
+    result = be.empty(optree.shape)
+    result._assign(optree)
+    return result
 
 
 class RBMLayer(ParameterLayer):
@@ -32,20 +37,57 @@ class RBMLayer(ParameterLayer):
         init (Optional[Initializer]): Initializer object to use for
             initializing layer weights
         name (Optional[str]): layer name. Defaults to "RBMLayer"
+
+    Note: kwargs are used only for multiple inheritance. See ConvolutionalRBMLayer
     """
 
-    def __init__(self, n_hidden, init=None, name="RBMLayer"):
-        super(RBMLayer, self).__init__(init, name)
+    def __init__(self, n_hidden, init=None, name="RBMLayer", parallelism="Unknown", **kwargs):
+        super(RBMLayer, self).__init__(init, name, parallelism)
         self.b_hidden = None
         self.b_visible = None
 
         self.sigmoid = Logistic()
 
         self.chain = None
-
-        # keep around args in __dict__ for get_description.
         self.n_hidden = n_hidden
         self.n_visible = None
+
+    def allocate(self, shared_outputs=None):
+        super(RBMLayer, self).allocate(shared_outputs)
+
+        # self.W must be already initialized
+        self.init_params(None, self.b_vis_shape, self.b_hid_shape)
+
+    def configure(self, in_obj):
+        """
+        sets shape based parameters of this layer given an input tuple or int
+        or input layer
+
+        Arguments:
+            in_obj (int, tuple, Layer or Tensor or dataset): object that provides shape
+                                                             information for layer
+
+        Returns:
+            (tuple): shape of output data
+        """
+        super(RBMLayer, self).configure(in_obj)
+
+        #TODO: self.in_shape must be an int. Check this
+        self.n_visible = self.in_shape
+        if isinstance(self.in_shape, tuple):
+            self.n_visible = reduce(mul, self.in_shape)
+
+        self.out_shape = (self.n_hidden,)
+
+        self.weight_shape = (self.n_visible, self.n_hidden)
+
+        # bias for visible units
+        self.b_vis_shape = (self.n_visible, 1)
+
+        # bias for hidden units
+        self.b_hid_shape = (self.n_hidden, 1)
+
+        return self
 
     def init_params(self, shape=None, b_vis_shape=None, b_hid_shape=None):
         """
@@ -56,17 +98,17 @@ class RBMLayer(ParameterLayer):
             shape (int, tuple): shape to allocate for layer paremeter
                 buffers.
         """
-        if shape:
-            self.W = self.be.empty(shape)
-            self.dW = self.be.zeros_like(self.W)
-            self.init.fill(self.W)
+        # initialize self.W
+        if not shape is None:
+            super(RBMLayer, self).init_params(shape)
 
+        parallel, distributed = self.get_param_attrs()
         if not b_hid_shape is None:
-            self.b_hidden = self.be.zeros(b_hid_shape)
+            self.b_hidden = self.be.zeros(b_hid_shape, parallel=parallel, distributed=distributed)
             self.db_hidden = self.be.zeros_like(self.b_hidden)
 
         if not b_vis_shape is None:
-            self.b_visible = self.be.zeros(b_vis_shape)
+            self.b_visible = self.be.zeros(b_vis_shape, parallel=parallel, distributed=distributed)
             self.db_visible = self.be.zeros_like(self.b_visible)
 
     def get_params(self):
@@ -76,49 +118,58 @@ class RBMLayer(ParameterLayer):
         return ((self.W, self.dW, self.b_hidden, self.db_hidden,
                 self.b_visible, self.db_visible), self.states)
 
-    def init_buffers(self, inputs):
+    def get_params_serialize(self, keep_states=True):
         """
-        Helper for allocating output and delta buffers (but not initializing
-        them)
+        Get layer parameters. All parameters are needed for optimization, but
+        only Weights are serialized.
 
         Arguments:
-            inputs (Tensor): tensor used for frop inputs, used to determine
-                shape of buffers being allocated.
+            keep_states (bool): Control whether all parameters are returned
+                or just weights for serialization. Defaults to True.
         """
-        self.inputs = inputs
-        if not self.n_visible:
-            self.n_visible = self.inputs.shape[0]
-            self.visible_preacts = self.be.empty((self.n_visible, self.be.bsz))
-            self.hidden_preacts = self.be.empty((self.n_hidden, self.be.bsz))
+        serial_dict = {'params': {'W': self.W.asnumpyarray(),
+                                  'b_hidden': self.b_hidden.asnumpyarray(),
+                                  'b_visible': self.b_visible.asnumpyarray(),
+                                  'name': self.name}}
+        if keep_states:
+            serial_dict['states'] = [s.asnumpyarray() for s in self.states]
+        return serial_dict
 
-        if self.weight_shape is None:
-            self.weight_shape = (self.n_visible, self.n_hidden)
-
-        # bias for visible units
-        if not hasattr(self, 'b_vis_shape') or (hasattr(self, 'b_vis_shape') and self.b_vis_shape is None):
-            self.b_vis_shape = (self.n_visible, 1)
-
-        # bias for hidden units
-        if not hasattr(self, 'b_hid_shape') or (hasattr(self, 'b_hid_shape') and self.b_hid_shape is None):
-            self.b_hid_shape = (self.n_hidden, 1)
-
-    def fprop(self, inputs, labels=None, weights=None):
+    def set_params(self, pdict):
         """
-        forward propagation
-        """
-        hidden_proba = self.hidden_probability(inputs, weights=weights)
-        hidden_units = self.be.array(hidden_proba.get() >
-                                     self.be.rng.uniform(size=hidden_proba.shape))
-        return hidden_units, hidden_proba
+        Set layer parameters (weights). Allocate space for other parameters but do not initialize
+        them.
 
-    def bprop(self, hid_units=None, weights=None):
+        Arguments:
+            pdict (dict): dictionary or ndarray with layer parameters
+        """
+        # load pdict, convert self.W to Tensor
+        super(RBMLayer, self).set_params(pdict)
+
+        self.b_hidden = self.be.array(self.b_hidden)
+        self.db_hidden = self.be.empty_like(self.b_hidden)
+
+        self.b_visible = self.be.array(self.b_visible)
+        self.db_visible = self.be.array(self.b_visible)
+
+    def fprop(self, inputs, inference=False, labels=None):
+        """
+        forward propagation. Returns probability of hidden units
+        """
+        hidden_proba_optree = self.hidden_probability(inputs)
+        hidden_proba = self.be.empty(hidden_proba_optree.shape)
+        hidden_proba._assign(hidden_proba_optree)
+        return hidden_proba
+
+    def bprop(self, hidden_units, alpha=None, beta=None):
         """
         CD1 backward pass (negative phase)
+        Returns probability of visible units
         """
-        visible_proba = self.visible_probability(hid_units, weights=None)
-        visible_units = self.be.array(visible_proba.get() >
-                                      self.be.rng.uniform(size=visible_proba.shape))
-        return visible_units, visible_proba
+        visible_proba_optree = self.visible_probability(hidden_units)
+        visible_proba = self.be.empty(visible_proba_optree.shape)
+        visible_proba._assign(visible_proba_optree)
+        return visible_proba
 
     def _grad(self, visible_units, hidden_units):
         """
@@ -158,17 +209,22 @@ class RBMLayer(ParameterLayer):
         if persistant:
             if self.chain is None:
                 self.chain = self.be.zeros(h_pos.shape)
+            chain = self.chain
         else:
-            self.chain = self.be.array(h_pos.get() > self.be.rng.uniform(size=h_pos.shape))
+            chain = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
         for k in xrange(kPCD):
             if persistant:
-                v_neg = self.sample_visibles(self.chain)
+                v_neg = self.sample_visibles(chain)
             else:
-                v_neg = self.visible_probability(self.chain)
+                v_neg = self.visible_probability(chain)
 
             h_neg = self.hidden_probability(v_neg)
-            self.chain = self.be.array(h_neg.get() > self.be.rng.uniform(size=h_neg.shape))
+            chain = h_neg > self.be.array(self.be.rng.uniform(size=h_neg.shape))
+
+        # calculate chain explicitly
+        if persistant:
+            self.chain._assign(chain)
 
 
         if not collect_zero_signal:
@@ -199,38 +255,22 @@ class RBMLayer(ParameterLayer):
         """
         Calculate P(h | v)
         """
-        #initialization
-        self.init_buffers(inputs)
-        if self.W is None:
-            self.init_params(self.weight_shape)
-
-        if self.b_hidden is None:
-            self.init_params(b_hid_shape=self.b_hid_shape)
-
         if weights is None:
-            self.hidden_preacts[:] = self.be.dot(self.W.T, inputs)
-        else:
-            self.hidden_preacts[:] = self.be.dot(weights.T, inputs)
+            weights = self.W
 
-        hidden_proba = self.be.empty_like(self.hidden_preacts)
-        hidden_proba[:] = self.sigmoid(self.hidden_preacts + self.b_hidden)
-
+        hidden_preacts = self.be.dot(weights.T, inputs)
+        hidden_proba = self.sigmoid(hidden_preacts + self.b_hidden)
         return hidden_proba
 
     def visible_probability(self, hidden_units, weights=None):
         """
         Calculate P(v|h)
         """
-        if self.b_visible is None:
-            self.init_params(b_vis_shape=self.b_vis_shape)
-
         if weights is None:
-            self.visible_preacts[:] = self.be.dot(self.W, hidden_units) + self.b_visible
-        else:
-            self.visible_preacts[:] = self.be.dot(weights, hidden_units) + self.b_visible
+            weights = self.W
 
-        visible_proba = self.be.empty_like(self.visible_preacts)
-        visible_proba[:] = self.sigmoid(self.visible_preacts)
+        visible_preacts = self.be.dot(weights, hidden_units) + self.b_visible
+        visible_proba = self.sigmoid(visible_preacts)
         return visible_proba
 
     def sample_hiddens(self, visible_units, labels=None):
@@ -238,35 +278,34 @@ class RBMLayer(ParameterLayer):
         Sample hidden units.
         """
         h_probability = self.hidden_probability(visible_units)
-        return self.be.array(h_probability.get() > self.be.rng.uniform(size=h_probability.shape))
+        return h_probability > self.be.array(self.be.rng.uniform(size=h_probability.shape))
 
     def sample_visibles(self, hidden_units):
         """
         Sample visible units
         """
         v_probability = self.visible_probability(hidden_units)
-        return self.be.array(v_probability.get() > self.be.rng.uniform(size=v_probability.shape))
+        return v_probability > self.be.array(self.be.rng.uniform(size=v_probability.shape))
 
     def get_sparse_grads_b_hidden(self, h_proba, sparse_target=0, sparse_damping=0, sparse_cost=0):
-
         if sparse_cost == 0:
             return self.be.zeros_like(self.b_hidden)
 
         if not hasattr(self, 'hidmeans'):
-            self.hidmeans = sparse_target * self.be.ones((self.n_hidden, 1))
+            self.hidmeans = self.be.empty((self.n_hidden, 1))
+            self.hidmeans[:] = sparse_target * self.be.ones((self.n_hidden, 1))
 
         hidden_probability_mean = self.be.mean(h_proba, axis=-1)
         self.hidmeans[:] = sparse_damping * self.hidmeans + (1 - sparse_damping) * hidden_probability_mean
 
-        sparsegrads_b_hidden = sparse_cost * (self.hidmeans.get() - sparse_target)
-        return self.be.array(sparsegrads_b_hidden.reshape(-1, 1))
+        sparsegrads_b_hidden = sparse_cost * (self.hidmeans - sparse_target)
+        return sparsegrads_b_hidden
 
     def free_energy(self, inputs):
         """
         Calculate cost
         """
-        Wv_b = self.be.empty_like(self.hidden_preacts)
-        Wv_b[:] = self.be.dot(self.W.T, inputs) + self.b_hidden
+        Wv_b = self.be.dot(self.W.T, inputs) + self.b_hidden
         energy = self.be.empty((1, self.be.bsz))
         energy[:] = -self.be.dot(self.b_visible.T, inputs) - self.be.sum(self.be.log(1 + self.be.exp(Wv_b)), axis=0)
         return energy
@@ -321,40 +360,30 @@ class RBMLayerWithLabels(RBMLayer):
         self.fast_b_hidden = 0
         self.fast_b_visible = 0
 
-    def init_buffers(self, inputs, labels=None):
-        """
-        Helper for allocating output and delta buffers (but not initializing
-        them)
+    def allocate_fast_weights(self, use_fast_weights):
+        if use_fast_weights:
+            self.fast_W = self.be.zeros(self.weight_shape)
+            self.fast_dW = self.be.zeros(self.weight_shape)
+            self.fast_b_hidden = self.be.zeros(self.b_hid_shape)
+            self.fast_db_hidden = self.be.zeros(self.b_hid_shape)
+            self.fast_b_visible = self.be.zeros(self.b_vis_shape)
+            self.fast_db_visible = self.be.zeros(self.b_vis_shape)
+        else:
+            self.fast_W = 0
+            self.fast_b_hidden = 0
+            self.fast_b_visible = 0
 
-        Arguments:
-            inputs (Tensor): tensor used for frop inputs, used to determine
-                shape of buffers being allocated.
-            labels (Tensor): tensor with labels of inputs, one-hot Encoding
-        """
+    def configure(self, in_obj):
+        super(RBMLayerWithLabels, self).configure(in_obj)
 
-        if not self.n_visible:
-            self.n_visible = inputs.shape[0]
-            if not labels is None:
-                self.n_visible += self.n_classes
-            self.visible_preacts = self.be.empty((self.n_visible, self.be.bsz))
-            self.hidden_preacts = self.be.empty((self.n_hidden, self.be.bsz))
+        self.weight_shape = (self.weight_shape[0] + self.n_classes, self.weight_shape[1])
+        self.b_vis_shape = (self.b_vis_shape[0] + self.n_classes, self.b_vis_shape[1])
+        return self
 
-        if self.weight_shape is None:
-            self.weight_shape = (self.n_visible, self.n_hidden)
-
-        # bias for visible units
-        if not hasattr(self, 'b_vis_shape') or (hasattr(self, 'b_vis_shape') and self.b_vis_shape is None):
-            self.b_vis_shape = (self.n_visible, 1)
-
-        # bias for hidden units
-        if not hasattr(self, 'b_hid_shape') or (hasattr(self, 'b_hid_shape') and self.b_hid_shape is None):
-            self.b_hid_shape = (self.n_hidden, 1)
-
-    def fprop(self, inputs, labels=None):
+    def fprop(self, inputs, inference=False, labels=None):
         """
         Calculate hidden units
         """
-        v_units = inputs
         if labels is None:
             ohe_labels = np.zeros((self.n_classes, self.be.bsz))
         else:
@@ -364,80 +393,68 @@ class RBMLayerWithLabels(RBMLayer):
 
         return super(RBMLayerWithLabels, self).fprop(v_units)
 
-    def hidden_probability(self, inputs, labels=None, fast_weights=None, fast_b_hidden=0):
+    def hidden_probability(self, inputs, labels=None, fast_weights=0, fast_b_hidden=0):
         """
         Calculate P(h | v)
         """
-        #initialization
-        self.init_buffers(inputs, labels)
-        if self.W is None:
-            self.init_params(self.weight_shape)
-
-        if self.b_hidden is None:
-            self.init_params(b_hid_shape=self.b_hid_shape)
-
-        weights = self.W_labels
-        if not fast_weights is None:
-            weights[:] = weights + fast_weights
+        weights = _calc_optree(self.W + fast_weights, self.be)
 
         v_units = inputs
-        if not labels is None:
-            ohe_labels = label2binary(labels, self.n_classes)
-            v_units = self.be.array(np.vstack((ohe_labels, inputs.get())))
+        if inputs.shape[0] != self.W.shape[0]:
+            if not labels is None:
+                ohe_labels = label2binary(labels, self.n_classes)
+                v_units = self.be.array(np.vstack((ohe_labels, inputs.get())))
 
-        self.hidden_preacts[:] = self.be.dot(weights.T, v_units)
+        if v_units.shape[0] == self.W.shape[0]:
+            weights[:self.n_classes] *= self.n_duplicates
+        else:
+            weights = weights[self.n_classes:]
 
-        hidden_proba = self.be.empty_like(self.hidden_preacts)
-        hidden_proba[:] = self.sigmoid(self.hidden_preacts + self.b_hidden + fast_b_hidden)
-
+        hidden_preacts = self.be.dot(weights.T, v_units) + self.b_hidden + fast_b_hidden
+        hidden_proba = self.sigmoid(hidden_preacts)
         return hidden_proba
 
-    def visible_probability(self, hidden_units, fast_weights=None, fast_b_visible=0):
+    def visible_probability(self, hidden_units, fast_weights=0, fast_b_visible=0):
         """
         Calculate P(v|h)
         """
-        if self.b_visible is None:
-            self.init_params(b_vis_shape=self.b_vis_shape)
+        weights = self.W + fast_weights
+        visible_preacts = _calc_optree(self.be.dot(weights, hidden_units) + self.b_visible + fast_b_visible,
+                                       self.be)
+        visible_probability = self.be.empty_like(visible_preacts)
+        visible_probability[self.n_classes:] = self.sigmoid(visible_preacts[self.n_classes:])
 
-        if fast_weights is None:
-            self.visible_preacts[:] = self.be.dot(self.W, hidden_units) + self.b_visible
-            visible_probability = self.be.empty(self.visible_preacts.shape)
-            visible_probability[:] = self.sigmoid(self.visible_preacts)
-            return visible_probability
+        # TODO: chekc the axis
+        temp_exponential = self.be.exp(visible_preacts[:self.n_classes] -
+                                       self.be.max(visible_preacts[:self.n_classes], axis=0))
+        visible_probability[:self.n_classes] = temp_exponential / self.be.sum(temp_exponential, axis=0)
+        return visible_probability
 
-        self.visible_preacts[:] = self.be.dot(self.W + fast_weights, hidden_units) + self.b_visible + fast_b_visible
-        visible_proba = self.be.empty_like(self.visible_preacts)
-        visible_proba[self.n_classes:] = self.sigmoid(self.visible_preacts[self.n_classes:])
-
-        temp_exponential = self.be.exp(self.visible_preacts[:self.n_classes] -
-                                       self.be.max(self.visible_preacts[:self.n_classes], axis=0))
-        visible_proba[:self.n_classes] = temp_exponential / self.be.sum(temp_exponential, axis=0)
-        return visible_proba
-
-    def sample_hiddens(self, visible_units, labels=None, fast_weights=None, fast_b_hidden=0):
+    def sample_hiddens(self, visible_units, labels=None, fast_weights=0, fast_b_hidden=0):
         """
         Sample hidden units.
         """
         h_probability = self.hidden_probability(visible_units, labels, fast_weights, fast_b_hidden)
-        return self.be.array(h_probability.get() > self.be.rng.uniform(size=h_probability.shape))
+        return h_probability > self.be.array(self.be.rng.uniform(size=h_probability.shape))
 
-    def sample_visibles(self, hidden_units, fast_weights=None, fast_b_visible=0):
+    def sample_visibles(self, hidden_units, fast_weights=0, fast_b_visible=0):
         """
         Sample visible units
         """
         v_units = self.visible_probability(hidden_units, fast_weights, fast_b_visible)
-        v_units[self.n_classes:] = self.be.array(v_units[self.n_classes:].get() >
-                                                 self.be.rng.uniform(size=v_units[self.n_classes:].shape))
+        v_units[self.n_classes:] = (v_units[self.n_classes:] >
+                                    self.be.array(self.be.rng.uniform(size=v_units[self.n_classes:].shape)))
 
+        v_units_tensor = _calc_optree(v_units, self.be)
         # multinomial distribution with n = 1 (number of trials)
         random_numbers = self.be.rng.uniform(size=self.be.bsz)
-        probabilities = v_units[:self.n_classes].get().cumsum(axis=0)
+        probabilities = v_units_tensor[:self.n_classes].get().cumsum(axis=0)
         for i in xrange(self.n_classes):
             if i == 0:
-                v_units[i] = random_numbers < probabilities[i]
+                v_units_tensor.get()[i] = random_numbers < probabilities[i]
             else:
-                v_units[i] = (random_numbers >= probabilities[i - 1]) & (random_numbers < probabilities[i])
-        return v_units
+                v_units_tensor.get()[i] = (random_numbers >= probabilities[i - 1]) & (random_numbers < probabilities[i])
+        return v_units_tensor
 
     def update(self, v_pos, labels=None, persistant=False, kPCD=1, use_fast_weights=False,
                sparse_target=0, sparse_damping=0, sparse_cost=0, collect_zero_signal=True):
@@ -462,26 +479,12 @@ class RBMLayerWithLabels(RBMLayer):
             raise Exception('"labels" must be provided!')
 
         ohe_labels = label2binary(labels, self.n_classes)
+        v_pos = _calc_optree(v_pos, self.be)
         v_pos_with_labels = self.be.array(np.vstack((ohe_labels, v_pos.get())))
 
         # positive phase
-        if use_fast_weights:
-            if self.fast_W is None:
-                self.init_buffers(v_pos_with_labels)
-                if self.W is None:
-                    self.init_params(shape=self.weight_shape)
-
-                self.fast_W = self.be.zeros(self.weight_shape)
-                self.fast_dW = self.be.zeros(self.weight_shape)
-                self.fast_b_hidden = self.be.zeros(self.b_hid_shape)
-                self.fast_db_hidden = self.be.zeros(self.b_hid_shape)
-                self.fast_b_visible = self.be.zeros(self.b_vis_shape)
-                self.fast_db_visible = self.be.zeros(self.b_vis_shape)
-
-            self.W_labels = self.W.copy(self.W)
-            self.W_labels[:self.n_classes] = self.W_labels[:self.n_classes] * self.n_duplicates
-            temp_fast_W = self.fast_W.copy(self.fast_W)
-            temp_fast_W[:self.n_classes] = temp_fast_W[:self.n_classes] * self.n_duplicates
+        if self.fast_W is None:
+            self.allocate_fast_weights(use_fast_weights)
 
         h_pos = self.hidden_probability(v_pos_with_labels)
 
@@ -493,24 +496,23 @@ class RBMLayerWithLabels(RBMLayer):
         if persistant:
             if self.chain is None:
                 self.chain = self.be.zeros(h_pos.shape)
+            chain = self.chain
         else:
-            self.chain = self.be.array(h_pos.get() > self.be.rng.uniform(size=h_pos.shape))
+            chain = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
         for k in xrange(kPCD):
             if persistant:
-                v_neg = self.sample_visibles(self.chain, self.fast_W, self.fast_b_visible)
+                v_neg = self.sample_visibles(chain, self.fast_W, self.fast_b_visible)
             else:
-                v_neg = self.visible_probability(self.chain, self.fast_W, self.fast_b_visible)
+                v_neg = self.visible_probability(chain, self.fast_W, self.fast_b_visible)
 
-            if use_fast_weights:
-                h_neg = self.hidden_probability(v_neg, fast_weights=temp_fast_W, fast_b_hidden=self.fast_b_hidden)
-            else:
-                h_neg = self.hidden_probability(v_neg)
+            h_neg = self.hidden_probability(v_neg, fast_weights=self.fast_W, fast_b_hidden=self.fast_b_hidden)
 
-            self.chain = self.be.array(h_neg.get() > self.be.rng.uniform(size=h_neg.shape))
+            chain = h_neg > self.be.array(self.be.rng.uniform(size=h_neg.shape))
 
+        if persistant:
+            self.chain = _calc_optree(chain, self.be)
 
-        # update_W = self.be.dot(v_pos_with_labels, h_pos.T) - self.be.dot(v_neg, h_neg.T)
         update_W = self._grad(v_pos_with_labels, h_pos) - self._grad(v_neg, h_neg)
         update_b_visible = self.be.mean(v_pos_with_labels - v_neg, axis=-1)
         update_b_hidden = self.be.mean(h_pos - h_neg, axis=-1) - sparsegrads_b_hidden
@@ -527,31 +529,31 @@ class RBMLayerWithLabels(RBMLayer):
         """
 
         # positive phase
-        self.W_labels = self.W.copy(self.W)
-        self.W_labels[:self.n_classes] = self.W_labels[:self.n_classes] * self.n_duplicates
-        h_pos = self.hidden_probability(v_pos)
-        h_pos_sample = self.be.array(h_pos.get() > self.be.rng.uniform(size=h_pos.shape))
+        h_pos = self.hidden_probability(v_pos, labels)
+        h_pos_sample = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
         # negative phase
         if persistant:
             if self.chain is None:
                 self.chain = self.be.zeros(h_pos.shape)
+            chain = self.chain
         else:
-            self.chain = h_pos_sample
+            chain = h_pos_sample
 
         for k in xrange(kPCD):
-            v_neg = self.visible_probability(self.chain)
+            v_neg = self.visible_probability(chain)
 
             v_neg_sample = v_neg.copy(v_neg)
-            v_neg_sample[self.n_classes:] = self.be.array(v_neg[self.n_classes:].get() >
-                                                          self.be.rng.uniform(size=v_neg[self.n_classes:].shape))
+            v_neg_sample[self.n_classes:] = (v_neg[self.n_classes:] >
+                                             self.be.array(self.be.rng.uniform(size=v_neg[self.n_classes:].shape)))
 
             h_neg = self.hidden_probability(v_neg)
 
-            self.chain = self.be.array(h_neg.get() > self.be.rng.uniform(size=h_neg.shape))
+            chain = h_neg > self.be.array(self.be.rng.uniform(size=h_neg.shape))
 
+        if persistant:
+            self.chain = _calc_optree(chain, self.be)
 
-        # update_W = self.be.dot(v_pos, h_pos_sample.T) - self.be.dot(v_neg_sample, h_neg.T)
         update_W = self._grad(v_pos, h_pos_sample) - self._grad(v_neg_sample, h_neg)
         update_b_visible = self.be.mean(v_pos - v_neg_sample, axis=-1)
         update_b_hidden = self.be.mean(h_pos_sample - h_neg, axis=-1)
@@ -580,7 +582,7 @@ def label2binary(label, n_classes):
     return binary
 
 
-class RBMConvolution3D(RBMLayer):
+class ConvolutionalRBMLayer(RBMLayer):
     """
     Convolutional RBM layer implementation.
     Works with volumetric data
@@ -600,26 +602,22 @@ class RBMConvolution3D(RBMLayer):
         name (Optional[str]): layer name. Defaults to "ConvolutionLayer"
     """
 
-    def __init__(self, fshape, strides={}, padding={}, init=None, name="ConvolutionLayer"):
-        super(RBMConvolution3D, self).__init__(reduce(mul, fshape), init=init, name=name)
+    def __init__(self, fshape, strides={}, padding={}, init=None, bsum=False, name="ConvolutionalRBMLayer", parallelism="Data"):
+        super(ConvolutionalRBMLayer, self).__init__(0, init=init, name=name, parallelism=parallelism)
+
         self.nglayer = None
-
-        self.nglayer_grad_W = None
-        self.nglayer_deconv = None
-
-        self.hidden_preacts = None
-        self.visible_preacts = None
-
         self.convparams = {'str_h': 1, 'str_w': 1, 'str_d': 1,
-                           'pad_h': 0, 'pad_w': 0, 'pad_d': 0}
+                           'pad_h': 0, 'pad_w': 0, 'pad_d': 0,
+                           'T': 1, 'D': 1, 'bsum': bsum}  # 3D paramaters
 
         # keep around args in __dict__ for get_description.
         self.fshape = fshape
         self.strides = strides
         self.padding = padding
 
-        if isinstance(fshape, (tuple, list)):
-            fshape = {'T': fshape[0], 'R': fshape[1], 'S': fshape[2], 'K': fshape[3]}
+        if isinstance(fshape, tuple):
+            fkeys = ('R', 'S', 'K') if len(fshape) == 3 else ('T', 'R', 'S', 'K')
+            fshape = {k: x for k, x in zip(fkeys, fshape)}
         if isinstance(strides, int):
             strides = {'str_d': strides, 'str_h': strides, 'str_w': strides}
         if isinstance(padding, int):
@@ -627,70 +625,95 @@ class RBMConvolution3D(RBMLayer):
         for d in [fshape, strides, padding]:
             self.convparams.update(d)
 
-        self.n_hidden_units = fshape['T'] * fshape['R'] * fshape['S']
+        self.b_vis_shape = None
+        self.b_hid_shape = None
 
-    def init_buffers(self, inputs):
-        """
-        Helper for allocating output and delta buffers (but not initializing
-        them)
+    def configure(self, in_obj):
+        super(ConvolutionalRBMLayer, self).configure(in_obj)
 
-        Arguments:
-            inputs (Tensor): tensor used for frop inputs, used to determine
-                shape of buffers being allocated.
-        """
-        self.inputs = inputs
-        if not self.nglayer:
-            assert hasattr(self.inputs, 'lshape')
-            self.n_visible = reduce(mul, self.inputs.lshape[:4])
-            self.convparams['C'] = self.inputs.lshape[0] # n_input_feature_maps
-            self.convparams['D'] = self.inputs.lshape[1] # depth of image
-            self.convparams['H'] = self.inputs.lshape[2] # height of image
-            self.convparams['W'] = self.inputs.lshape[3] # width of image
-            self.convparams['N'] = self.be.bsz # n_images in mini-batch
+        if self.nglayer is None:
+            assert isinstance(self.in_shape, tuple)
+            ikeys = ('C', 'H', 'W') if len(self.in_shape) == 3 else ('C', 'D', 'H', 'W')
+            shapedict = {k: x for k, x in zip(ikeys, self.in_shape)}
+            shapedict['N'] = self.be.bsz
+            self.convparams.update(shapedict)
             self.nglayer = self.be.conv_layer(self.be.default_dtype, **self.convparams)
-            self.hidden_preacts = self.be.iobuf(self.nglayer.nOut, self.hidden_preacts)
-            self.hidden_preacts.lshape = (self.nglayer.K, self.nglayer.M, self.nglayer.P, self.nglayer.Q)
-            # self.deltas = self.be.iobuf(self.inputs.shape[0], self.deltas)
+            (K, M, P, Q, N) = self.nglayer.dimO
+            self.out_shape = (K, P, Q) if M == 1 else (K, M, P, Q)
 
-        if not self.nglayer_deconv:
-            # deconv layer for convolving H and W_flipped (to obtain V in negative phase)
-            self.deconvparams = self.convparams.copy()
-            del self.deconvparams['D']
-            del self.deconvparams['H']
-            del self.deconvparams['W']
-            self.deconvparams['C'] = 1 # self.convparams['K']
-            self.deconvparams['K'] = 1 # self.convparams['C']
-            self.deconvparams['M'] = self.nglayer.M
-            self.deconvparams['P'] = self.nglayer.P
-            self.deconvparams['Q'] = self.nglayer.Q
-            self.nglayer_deconv = self.be.deconv_layer(self.be.default_dtype, **self.deconvparams)
-            self.visible_preacts = self.be.iobuf(self.nglayer_deconv.nOut, self.visible_preacts)
-            self.visible_preacts.lshape = (self.nglayer_deconv.C, self.nglayer_deconv.D,
-                                           self.nglayer_deconv.H, self.nglayer_deconv.W)
+            self.n_hidden = self.nglayer.dimO2[0]
 
-        # conv layer and params for convolving V and P(H|V)
-        if not self.nglayer_grad_W:
-            self.convparams_grad_W = self.convparams.copy()
-            self.convparams_grad_W['N'] = self.be.bsz
-            self.convparams_grad_W['T'] = self.nglayer.M # depth of filter
-            self.convparams_grad_W['R'] = self.nglayer.P # height of filter
-            self.convparams_grad_W['S'] = self.nglayer.Q # width of filter
-            self.nglayer_grad_W = ConvLayerGrad(self.be, self.be.default_dtype, **self.convparams_grad_W)
-            # self.visible_preacts = None
-            # self.visible_preacts = self.be.iobuf(self.nglayer_grad_W.nOut, self.visible_preacts)
+            self.weight_shape = self.nglayer.dimF2  # (C * R * S, K)
+        if self.convparams['bsum']:
+            self.batch_sum_shape = (self.nglayer.K, 1)
 
-        if self.weight_shape is None:
-            self.weight_shape = self.nglayer.dimF2  # (C * T * R * S, K)
+        self.b_vis_shape = (reduce(mul, self.in_shape), 1)
+        self.b_hid_shape = (self.convparams['K'], 1) # K x 1 x 1 x 1 - number of output feature maps
 
-        # bias for visible units
-        if not hasattr(self, 'b_vis_shape') or (hasattr(self, 'b_vis_shape') and self.b_vis_shape is None):
-            # c in Matlab code
-            self.b_vis_shape = (reduce(mul, self.inputs.lshape[1:4]), 1)
+        return self
 
-        # bias for hidden units
-        if not hasattr(self, 'b_hid_shape') or (hasattr(self, 'b_hid_shape') and self.b_hid_shape is None):
-            # b in Matlab code
-            self.b_hid_shape = (self.convparams['K'], 1) # K x 1 x 1 x 1 - number of output feature maps
+    # def init_buffers(self, inputs):
+    #     """
+    #     Helper for allocating output and delta buffers (but not initializing
+    #     them)
+
+    #     Arguments:
+    #         inputs (Tensor): tensor used for frop inputs, used to determine
+    #             shape of buffers being allocated.
+    #     """
+    #     self.inputs = inputs
+    #     if not self.nglayer:
+    #         assert hasattr(self.inputs, 'lshape')
+    #         self.n_visible = reduce(mul, self.inputs.lshape[:4])
+    #         self.convparams['C'] = self.inputs.lshape[0] # n_input_feature_maps
+    #         self.convparams['D'] = self.inputs.lshape[1] # depth of image
+    #         self.convparams['H'] = self.inputs.lshape[2] # height of image
+    #         self.convparams['W'] = self.inputs.lshape[3] # width of image
+    #         self.convparams['N'] = self.be.bsz # n_images in mini-batch
+    #         self.nglayer = self.be.conv_layer(self.be.default_dtype, **self.convparams)
+    #         self.hidden_preacts = self.be.iobuf(self.nglayer.nOut, self.hidden_preacts)
+    #         self.hidden_preacts.lshape = (self.nglayer.K, self.nglayer.M, self.nglayer.P, self.nglayer.Q)
+    #         # self.deltas = self.be.iobuf(self.inputs.shape[0], self.deltas)
+
+    #     if not self.nglayer_deconv:
+    #         # deconv layer for convolving H and W_flipped (to obtain V in negative phase)
+    #         self.deconvparams = self.convparams.copy()
+    #         del self.deconvparams['D']
+    #         del self.deconvparams['H']
+    #         del self.deconvparams['W']
+    #         self.deconvparams['C'] = 1 # self.convparams['K']
+    #         self.deconvparams['K'] = 1 # self.convparams['C']
+    #         self.deconvparams['M'] = self.nglayer.M
+    #         self.deconvparams['P'] = self.nglayer.P
+    #         self.deconvparams['Q'] = self.nglayer.Q
+    #         self.nglayer_deconv = self.be.deconv_layer(self.be.default_dtype, **self.deconvparams)
+    #         self.visible_preacts = self.be.iobuf(self.nglayer_deconv.nOut, self.visible_preacts)
+    #         self.visible_preacts.lshape = (self.nglayer_deconv.C, self.nglayer_deconv.D,
+    #                                        self.nglayer_deconv.H, self.nglayer_deconv.W)
+
+    #     # conv layer and params for convolving V and P(H|V)
+    #     if not self.nglayer_grad_W:
+    #         self.convparams_grad_W = self.convparams.copy()
+    #         self.convparams_grad_W['N'] = self.be.bsz
+    #         self.convparams_grad_W['T'] = self.nglayer.M # depth of filter
+    #         self.convparams_grad_W['R'] = self.nglayer.P # height of filter
+    #         self.convparams_grad_W['S'] = self.nglayer.Q # width of filter
+    #         self.nglayer_grad_W = ConvLayerGrad(self.be, self.be.default_dtype, **self.convparams_grad_W)
+    #         # self.visible_preacts = None
+    #         # self.visible_preacts = self.be.iobuf(self.nglayer_grad_W.nOut, self.visible_preacts)
+
+    #     if self.weight_shape is None:
+    #         self.weight_shape = self.nglayer.dimF2  # (C * T * R * S, K)
+
+    #     # bias for visible units
+    #     if not hasattr(self, 'b_vis_shape') or (hasattr(self, 'b_vis_shape') and self.b_vis_shape is None):
+    #         # c in Matlab code
+    #         self.b_vis_shape = (reduce(mul, self.inputs.lshape[1:4]), 1)
+
+    #     # bias for hidden units
+    #     if not hasattr(self, 'b_hid_shape') or (hasattr(self, 'b_hid_shape') and self.b_hid_shape is None):
+    #         # b in Matlab code
+    #         self.b_hid_shape = (self.convparams['K'], 1) # K x 1 x 1 x 1 - number of output feature maps
 
     def _grad(self, visible_units, hidden_units):
         """
@@ -700,35 +723,29 @@ class RBMConvolution3D(RBMLayer):
             visible_units (Tensor): visible units
             hidden_units (Tensor): hidden units (or their probabilities)
         """
-        result = self.be.empty(self.nglayer_grad_W.dimO2)
-        #TODO: this should be moved to backend. Currently works only with CPU backend
-        fprop_conv_grad(self.nglayer_grad_W, visible_units, hidden_units, result)
-        return self.be.divide(result, self.be.bsz, out=result)
+        result = self.be.empty_like(self.W)
+        visible_units_tensor = _calc_optree(visible_units, self.be)
+        hidden_units_tensor = _calc_optree(hidden_units, self.be)
+        self.be.update_conv(self.nglayer, visible_units_tensor, hidden_units_tensor, result)
+        # TODO: check that division by the batch size is needed. It maybe not because of self.batch_sum
+        return result / self.be.bsz
 
-    def _complex_mean(self, input_array, mean_axes):
-        """
-        calculate mean(mean(mean(..., axis=-1), axis=2), axis=3), axis=4)
-        """
-        shape = [dim for dim in input_array.shape]
-        array_to_average = input_array
-        for axis in mean_axes:
-            shape[axis] = 1
-            intermediate_mean = self.be.empty(shape)
-            intermediate_mean[:] = self.be.sum(array_to_average, axis=axis)
-            array_to_average = intermediate_mean
+    # def _complex_mean(self, input_array, mean_axes):
+    #     """
+    #     calculate mean(mean(mean(..., axis=-1), axis=2), axis=3), axis=4)
+    #     """
+    #     #TODO: this function maybe not needed. In new version it seems to work like in numpy
+    #     shape = [dim for dim in input_array.shape]
+    #     array_to_average = input_array
+    #     for axis in mean_axes:
+    #         shape[axis] = 1
+    #         intermediate_mean = self.be.empty(shape)
+    #         intermediate_mean[:] = self.be.sum(array_to_average, axis=axis)
+    #         array_to_average = intermediate_mean
 
-        return self.be.array(np.squeeze(intermediate_mean.get()).reshape(-1, 1) / self.be.bsz)
+    #     return self.be.array(np.squeeze(intermediate_mean.get()).reshape(-1, 1) / self.be.bsz)
 
-    def _update_b_hidden(self, h):
-        """
-        calculate mean(sum(sum(sum(h_pos - h_neg), axis=1), axis=1, axis=1), axix=-1)
-        """
-        h_mean = self.be.empty((h.shape[0], 1))
-        h_mean[:] = self.be.mean(h, axis=-1)
-        h_mean = h_mean.reshape(self.convparams['K'], -1)
-        return self.be.sum(h_mean, axis=-1)
-
-    def update(self, v_pos, persistant=False, kPCD=1, use_fast_weights=False,
+    def update(self, v_pos, labels=None, persistant=False, kPCD=1, use_fast_weights=False,
                sparse_target=0, sparse_damping=0, sparse_cost=0, collect_zero_signal=True):
         """
         Calculate gradients
@@ -752,18 +769,21 @@ class RBMConvolution3D(RBMLayer):
         if persistant:
             if self.chain is None:
                 self.chain = self.be.zeros(h_pos.shape)
+            chain = self.chain
         else:
-            self.chain = self.be.array(h_pos.get() > self.be.rng.uniform(size=h_pos.shape))
+            chain = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
         for k in xrange(kPCD):
             if persistant:
-                v_neg = self.sample_visibles(self.chain)
+                v_neg = self.sample_visibles(chain)
             else:
-                v_neg = self.visible_probability(self.chain)
+                v_neg = self.visible_probability(chain)
 
             h_neg = self.hidden_probability(v_neg)
-            self.chain = self.be.array(h_neg.get() > self.be.rng.uniform(size=h_neg.shape))
+            chain = h_neg > self.be.array(self.be.rng.uniform(size=h_neg.shape))
 
+        if persistant:
+            self.chain._assign(chain)
 
         if not collect_zero_signal:
             zero_signal_mask = self.hidden_preacts.get() == 0
@@ -779,11 +799,13 @@ class RBMConvolution3D(RBMLayer):
                                                                   sparse_damping, sparse_cost)
             zeros_ratio = 1
 
-        update_W = self._conv_grad(v_pos, h_pos) - self._conv_inputs_proba(v_neg, h_neg)
+        update_W = self._grad(v_pos, h_pos) - self._grad(v_neg, h_neg)
         update_b_visible = self.be.mean(v_pos - v_neg, axis=-1)
 
         #TODO: maybe this should be mean(mean(mean(...))) like in crbm.m?
-        update_b_hidden = self._update_b_hidden(h_pos - h_neg) - sparsegrads_b_hidden
+        update_b_hidden = _calc_optree(self.be.mean(h_pos - h_neg, axis=-1), self.be)
+        update_b_hidden = self.be.sum(update_b_hidden.reshape(self.convparams['K'], -1), axis=-1)
+        update_b_hidden -= sparsegrads_b_hidden
 
         result = {'W': update_W / float(self.be.bsz),
                   'b_hidden': update_b_hidden,
@@ -801,23 +823,19 @@ class RBMConvolution3D(RBMLayer):
             hidden_probability (Tensor): probability of hidden units (n_filters * n_hidden, batch_size)
         """
         #initialization
-        self.init_buffers(inputs)
-        if self.W is None:
-            self.init_params(self.weight_shape)
-
-        if self.b_hidden is None:
-            self.init_params(b_hid_shape=self.b_hid_shape)
-
         if weights is None:
-            self.be.fprop_conv(self.nglayer, inputs, self.W, self.hidden_preacts)
-        else:
-            self.be.fprop_conv(self.nglayer, inputs, weights, self.hidden_preacts)
+            weights = self.W
 
-        b_hidden = self.be.empty((self.convparams['K'], self.nglayer.nOut / self.convparams['K']))
-        b_hidden[:] = self.be.ones(b_hidden.shape) * self.b_hidden
+        # calculate operation tree for inputs
+        inputs_tensor = _calc_optree(inputs, self.be)
 
-        hidden_proba = self.be.empty_like(self.hidden_preacts)
-        hidden_proba[:] = self.sigmoid(self.hidden_preacts + b_hidden.reshape(-1, 1))
+        hidden_conv = self.be.empty((self.n_hidden, self.be.bsz))
+        self.be.fprop_conv(self.nglayer, inputs_tensor, weights, hidden_conv)
+
+        b_hidden = self.be.ones((self.convparams['K'], self.nglayer.nOut / self.convparams['K']))
+        b_hidden[:] = b_hidden * self.b_hidden
+        hidden_preacts = hidden_conv + b_hidden.reshape(-1, 1)
+        hidden_proba = self.sigmoid(hidden_preacts)
 
         return hidden_proba
 
@@ -825,33 +843,26 @@ class RBMConvolution3D(RBMLayer):
         """
         Calculate P(v|h)
         """
-        if self.b_visible is None:
-            self.init_params(b_vis_shape=self.b_vis_shape)
-
         if weights is None:
             weights = self.W
 
+        # calculate operation tree for hidden_units
+        hidden_units_tensor = _calc_optree(hidden_units, self.be)
+
+        visible_conv = self.be.empty((self.n_visible, self.be.bsz))
         # TODO: maybe we can interchange loop by one convolution? check this.
-        tmp_deconv = self.be.zeros(self.visible_preacts.shape)
-        hid_units = hidden_units.reshape(self.convparams['K'], -1, self.nglayer.dimO2[1])
-        for filter_idx in xrange(self.convparams['K']):
-            self.be.bprop_conv(layer=self.nglayer_deconv,
-                               F=weights[:, [filter_idx]],
-                               E=hid_units[[filter_idx]],
-                               grad_I=tmp_deconv)
-            self.visible_preacts[:] = self.visible_preacts + tmp_deconv
+        self.be.bprop_conv(layer=self.nglayer, F=weights, E=hidden_units_tensor, grad_I=visible_conv, bsum=self.batch_sum)
 
-        self.visible_preacts[:] = self.visible_preacts + self.b_visible
-
-        visible_proba = self.be.empty(self.visible_preacts.shape)
-        visible_proba[:] = self.sigmoid(self.visible_preacts)
+        visible_preacts = visible_conv + self.b_visible
+        visible_proba = self.sigmoid(visible_preacts)
         return visible_proba
 
     def get_sparse_grads_b_hidden(self, h_probability, sparse_target=1, sparse_damping=0, sparse_cost=1):
+        if sparse_cost == 0:
+            return self.be.zeros_like(self.b_hidden)
 
         if not hasattr(self, 'hidmeans'):
-            self.hidmeans = self.be.ones(self.nglayer.dimO[:-1])
-            self.hidmeans[:] *= sparse_target
+            self.hidmeans = self.be.ones(self.nglayer.dimO[:-1]) * sparse_target
 
         h_probability = h_probability.reshape(self.nglayer.dimO)
         hidden_probability_mean = self.be.empty(self.hidmeans.shape + (1,))
@@ -861,13 +872,3 @@ class RBMConvolution3D(RBMLayer):
         sparsegrads_b_hidden = sparse_cost * np.squeeze(np.mean(np.mean(np.mean(self.hidmeans.get() - sparse_target,
                                                                  axis=1), axis=1), axis=1))
         return self.be.array(sparsegrads_b_hidden.reshape(-1, 1))
-
-    def cost(self, inputs):
-        """
-        Calculate cost
-        """
-        hidden_probability
-
-
-
-

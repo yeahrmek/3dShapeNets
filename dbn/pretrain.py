@@ -4,7 +4,7 @@ sys.path.append('../dbn')
 
 from neon.backends import gen_backend
 from dataset import ModelNetDataset
-from rbm_layer import RBMConvolution3D
+from rbm_layer import ConvolutionalRBMLayer, RBMLayer, RBMLayerWithLabels
 from rbm import RBM
 from neon.callbacks.callbacks import Callbacks
 from neon.initializers import GlorotUniform
@@ -15,14 +15,15 @@ import time
 
 
 # path = '../../../../../Work/3DShapeNets/volumetric_data/'
-path = '../../3DShapeNetsMatlab/volumetric_data'
+# path = '../../3DShapeNetsMatlab/volumetric_data'
+path = '../../3DShapeNets/volumetric_data'
 classes = ['bathtub', 'bed', 'chair', 'desk']
+n_classes = len(classes)
 
 be = gen_backend(backend='cpu',
                  batch_size=32,
                  rng_seed=0,
-                 device_id=0,
-                 default_dtype=np.float32)
+                 device_id=0)
 
 data = ModelNetDataset(path, classes=classes, data_size=30, lshape=(1, 30, 30, 30))
 
@@ -42,10 +43,12 @@ n_epochs = 1
 
 init = GlorotUniform()
 
-layers = []
-
 # it seems that the data have shape 30x30x30, though I think it should be 24 with padding=2
-layers += [RBMConvolution3D([6, 6, 6, 1], strides=2, padding=0, init=init)]
+layers = [RBMConvolution3D([6, 6, 6, 48], strides=2, padding=0, init=init),
+          RBMConvolution3D([5, 5, 5, 160], strides=2, padding=0, init=init),
+          RBMConvolution3D([4, 4, 4, 512], strides=2, padding=0, init=init),
+          RBMLayer(1200, init=init),
+          RBMLayerWithLabels(4000, n_classes)]
 
 
 rbm = RBM(layers=layers)
