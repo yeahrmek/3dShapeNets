@@ -73,28 +73,6 @@ class RBM(Model):
         self.initialize(dataset, self.cost)
         self.total_cost = self.be.empty((1, 1))
 
-        if not 'persistant' in self.optimizer:
-            self.optimizer['persistant'] = False
-
-        if not 'kPCD' in self.optimizer:
-            self.optimizer['kPCD'] = 1
-
-        if not 'use_fast_weights' in self.optimizer:
-            self.optimizer['use_fast_weights'] = False
-
-        if not 'collect_zero_signal' in self.optimizer:
-            self.optimizer['collect_zero_signal'] = True
-
-        self.update_params = {'use_fast_weights': self.optimizer['use_fast_weights'],
-                              'persistant': self.optimizer['persistant'],
-                              'kPCD': self.optimizer['kPCD'],
-                              'sparse_target': self.optimizer['sparse_target'],
-                              'sparse_cost': self.optimizer['sparse_cost'],
-                              'sparse_damping': self.optimizer['sparse_damping'],
-                              'collect_zero_signal': self.optimizer['collect_zero_signal']}
-
-
-
         self.layer_being_trained = 0
 
         callbacks.on_train_begin(num_epochs[0])
@@ -128,16 +106,13 @@ class RBM(Model):
         #TODO: implement using Optimizer
         lr = self.optimizer['learning_rate']
         weight_decay = self.optimizer['weight_decay']
-        sparse_damping = self.optimizer['sparse_damping']
-        sparse_cost = self.optimizer['sparse_cost']
-        sparse_target = self.optimizer['sparse_target']
 
         # iterate through minibatches of the dataset
         for mb_idx, (x, t) in enumerate(dataset):
 
             callbacks.on_minibatch_begin(epoch, mb_idx)
 
-            x = self.fprop(x, fprop_to_layer=self.layer_being_trained)
+            x = self.fprop(x, labels=t, fprop_to_layer=self.layer_being_trained)
 
             # TODO: implement schedule
             momentum = self.optimizer['momentum'][-1]
@@ -147,7 +122,7 @@ class RBM(Model):
             layer = self.layers.layers_to_optimize[self.layer_being_trained]
 
             # this part for sparsity
-            update = layer.update(x, labels=t, **self.update_params)
+            update = layer.update(x, labels=t)
 
             layer.dW[:] = momentum * layer.dW + lr * (update['W'] - weight_decay * layer.W)
             # TODO: check this. Maybe division by n_visible is not correct.
@@ -159,7 +134,7 @@ class RBM(Model):
             layer.b_hidden[:] = layer.b_hidden + layer.db_hidden
 
             #update fast weights
-            if self.optimizer['use_fast_weights']:
+            if layer.use_fast_weights:
                 layer.fast_dW[:] = momentum * layer.fast_dW + lr * (update['W'] - weight_decay * layer.W)
                 layer.fast_db_visible[:] = momentum * layer.fast_db_visible + lr * update['b_visible']
                 layer.fast_db_hidden[:] = momentum * layer.fast_db_hidden + lr * update['b_hidden']
@@ -167,6 +142,12 @@ class RBM(Model):
                 layer.fast_W[:] = 19.0 / 20 * layer.fast_W + layer.fast_dW
                 layer.fast_db_visible[:] = 19.0 / 20 * layer.fast_b_visible + layer.fast_db_visible
                 layer.fast_db_hidden[:] = 19.0 / 20 * layer.fast_b_hidden + layer.fast_db_hidden
+
+            # import pdb
+            # pdb.set_trace()
+            # from neon.optimizers.optimizer import GradientDescentMomentum
+            # opt = GradientDescentMomentum(learning_rate=lr, wdecay=weight_decay, momentum_coef=momentum)
+            # opt.optimize(self.layers_to_optimize, epoch=epoch)
 
             callbacks.on_minibatch_end(epoch, mb_idx)
 
@@ -204,7 +185,7 @@ class RBM(Model):
 
         return np.array(prediction)
 
-    def fprop(self, x, inference=False, labels=None, fprop_to_layer=None):
+    def fprop(self, x, inference=False, labels=None, fprop_to_layer=None, use_recognition_weights=False):
         """
         Forward propagates a minibatch x through the model.
 
@@ -221,7 +202,10 @@ class RBM(Model):
             fprop_to_layer = len(self.layers.layers)
 
         for l in self.layers.layers[:fprop_to_layer]:
-            hidden_units = l.fprop(hidden_units, inference=inference, labels=labels)
+            if use_recognition_weights:
+                hidden_units = l.fprop(hidden_units, inference=inference, labels=labels, weights=l.UW)
+            else:
+                hidden_units = l.fprop(hidden_units, inference=inference, labels=labels)
 
         return hidden_units
 
@@ -283,6 +267,7 @@ class RBM(Model):
         """
 
         self.ws_optimizer = optimizer
+        self.ws_num_epochs = num_epochs
 
         # reset persistant chain of the top rbm layer
         if not layers_to_optimize[-1].chain is None:
@@ -328,6 +313,10 @@ class RBM(Model):
 
         reconstruction_errors = []
         Pseudolikelihood = []
+
+        layers = self.layers.layers_to_optimize
+        n_layers = len(layers)
+
         # iterate through minibatches of the dataset
         for mb_idx, (x, t) in enumerate(dataset):
 
@@ -335,75 +324,73 @@ class RBM(Model):
 
              # TODO: implement schedule
             momentum = self.ws_optimizer['momentum'][-1]
-            if self.epoch_index < self.num_epochs * self.ws_optimizer['step_config']:
+            if self.ws_epoch_index < self.ws_num_epochs * self.ws_optimizer['step_config']:
                 momentum = momentum[0]
 
             # wake phase. [BOTTOM-UP PASS] Assuming recognition weight is correct, and update the generative weight.
-            n_layers = len(self.layers_to_optimize)
-
             wake_states = [] * n_layers
             wake_states[0] = x
-            for i, l in enumrate(self.layers_to_optimize[:-1]):
+            for i, l in enumrate(layers[:-1]):
                 wake_states[i + 1], _ = l.fprop(wake_states[i], labels=t, weights=l.UW)
 
             # updates for top rbm. It slightly differs from
             update_top_W, update_top_b_visible, update_top_b_hidden, v_neg_top, v_neg_sample_top, h_neg_top = \
-                layers_to_optimize[-1].update_for_wake_sleep(x, t, **self.update_params)
+                layers[-1].update_for_wake_sleep(x, t, **self.update_params)
 
 
             # sleep phase. [TOP-DOWN PASS] Assuming generative weight is correct, and update the recognition weight.
             sleep_activations = [] * (n_layers + 1)
             sleep_activations[-1] = h_neg_top
-            sleep_activations[-2] = v_neg_top[layers_to_optimize[-1].n_classes:]
+            sleep_activations[-2] = v_neg_top[layers[-1].n_classes:]
             sleep_states = [] * n_layers
             sleep_statesp[-1] = layers_to_optimize[-1].chain
-            sleep_states[-2] = v_neg_sample_top[layers_to_optimize[-1].n_classes:]
+            sleep_states[-2] = v_neg_sample_top[layers[-1].n_classes:]
 
             # generating top - down
-            for i, l in reversed(list(enumerate(layers_to_optimize[:-1]))):
+            for i, l in reversed(list(enumerate(layers[:-1]))):
                 sleep_states[i], sleep_activations[i] = l.bprop(sleep_states[i + 1], weights=l.DW)
             sleep_states[0] = sleep_activations[0]
 
             # prediction
             p_gen = [] * (n_layers - 1)
-            for i, l in enumerate(layers_to_optimize[:-1]):
+            for i, l in enumerate(layers[:-1]):
                 _, p_gen[i] = l.bprop(wake_states[i + 1], weights=l.DW)
 
             p_rec = [] * (n_layers - 1)
-            for i, l in enumerate(layers_to_optimize[:-1]):
+            for i, l in enumerate(layers[:-1]):
                 _, p_rec[i] = l.fprop(sleep_states[i])
 
 
             ## update parameters
             # top rbm
-            layers_to_optimize[-1].dW[:] = momentum * layers_to_optimize[-1].dW + lr  * update_top_W
-            layers_to_optimize[-1].db_hidden[:] = momentum * layers_to_optimize[-1].db_hidden + lr  * update_b_hidden
-            layers_to_optimize[-1].db_visible[:] = momentum * layers_to_optimize[-1].db_visible + lr * update_b_visible
+            layers[-1].dW[:] = momentum * layers[-1].dW + lr  * update_top_W
+            layers[-1].db_hidden[:] = momentum * layers[-1].db_hidden + lr  * update_b_hidden
+            layers[-1].db_visible[:] = momentum * layers[-1].db_visible + lr * update_b_visible
 
-            layers_to_optimize[-1].W[:] = layers_to_optimize[-1].W[:] + layers_to_optimize[-1].dW
-            layers_to_optimize[-1].b_hidden[:] = layers_to_optimize[-1].b_hidden + layers_to_optimize[-1].db_hidden
-            layers_to_optimize[-1].b_visible[:] = layers_to_optimize[-1].b_visible + layers_to_optimize[-1].db_visible
-
+            layers[-1].W[:] = layers[-1].W + layers[-1].dW
+            layers[-1].b_hidden[:] = layers[-1].b_hidden + layers[-1].db_hidden
+            layers[-1].b_visible[:] = layers[-1].b_visible + layers[-1].db_visible
 
             #TODO: it looks like convolution in Matlab kConv_weights divides
             # the result by the batch size and by the size of filter. Check this and make corresponding fix
             # in the code below. Also, don't forget to review code of rbm_layer.py
 
             #generative weights
-            for i, l in enumerate(layers_to_optimize[:-1]):
+            for i, l in enumerate(layers[:-1]):
                 l.dDW[:] = momentum * l.dDW + lr * l.n_hidden_units * \
                            l._grad(wake_states[i] - p_gen[i], wake_states[i + 1]) / l.be.bsz
                 l.db_visible[:] = momentum * l.db_visible + lr * self.be.mean(wake_states[i] - p_gen[i], axis=-1)
-                l.dW[:] = l.dW + l.dDW
+                l.DW[:] = l.DW + l.dDW
                 l.b_visible[:] = l.b_visible + l.db_visible
 
             #recognition weights
-            for i, l in enumerate(layers_to_optimize[:-1]):
+            #TODO: check this
+            for i, l in enumerate(layers[:-1]):
                 l.dUW[:] = momentum * l.dUW + lr * l.n_hidden_units * \
                            l._grad(sleep_activations[i], sleep_states[i + 1] - p_rec[i]) / l.be.bsz
-                l.db_visible[:] = momentum * l.db_visible + lr * self.be.mean(wake_states[i] - p_gen[i], axis=-1)
-                l.dW[:] = l.dW + l.dDW
-                l.b_visible[:] = l.b_visible + l.db_visible
+                l.db_hidden[:] = momentum * l.db_hidden + lr * self.be.mean(sleep_states[i] - p_rec[i], axis=-1)
+                l.UW[:] = l.UW + l.dUW
+                l.b_hidden[:] = l.b_hidden + l.db_hidden
 
             callbacks.on_minibatch_end(epoch, mb_idx)
 
@@ -411,7 +398,7 @@ class RBM(Model):
         """
         Initialize layers for fine-tuning (wake-sleep algorithm)
         """
-        for l in self.layers_to_optimize[:-1]:
+        for l in self.layers.layers_to_optimize[:-1]:
             l.UW = l.W.copy(l.W)
             l.DW = l.W.copy(l.W)
 
@@ -420,6 +407,6 @@ class RBM(Model):
             l.dUW = l.be.zeros_like(l.uW)
             l.dDW = l.be.zeros_like(l.dW)
 
-        self.layers_to_optimize[-1].db_hidden = l.be.zeros_like(self.layers_to_optimize[-1].db_hidden)
-        self.layers_to_optimize[-1].db_visible = l.be.zeros_like(self.layers_to_optimize[-1].db_visible)
-        self.layers_to_optimize[-1].dW = l.be.zeros_like(self.layers_to_optimize[-1].dW)
+        self.layers.layers_to_optimize[-1].db_hidden = l.be.zeros_like(self.layers.layers_to_optimize[-1].db_hidden)
+        self.layers.layers_to_optimize[-1].db_visible = l.be.zeros_like(self.layers.layers_to_optimize[-1].db_visible)
+        self.layers.layers_to_optimize[-1].dW = l.be.zeros_like(self.layers.layers_to_optimize[-1].dW)

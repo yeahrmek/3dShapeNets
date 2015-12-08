@@ -37,12 +37,31 @@ class RBMLayer(ParameterLayer):
         init (Optional[Initializer]): Initializer object to use for
             initializing layer weights
         name (Optional[str]): layer name. Defaults to "RBMLayer"
+        persistant (bool): whether to use persistant CD
+        kPCD (int): number of samples generation during negative phase of CD (CD-k)
+        use_fast_weights (bool): whether to use fast weights CD algorithm for learning. Not implemented yet!
+        sparse_target (float): desired sparsity
+        sparse_damping (float): damping of sparsity parameters
+        sparse_cost (float): cost of not matching sparsity target
+        collect_zero_signal (bool): whether to use units with 0 signal during learning. Not supported.
 
     Note: kwargs are used only for multiple inheritance. See ConvolutionalRBMLayer
     """
 
-    def __init__(self, n_hidden, init=None, name="RBMLayer", parallelism="Unknown", **kwargs):
+    def __init__(self, n_hidden, init=None, name="RBMLayer", parallelism="Unknown",
+                 persistant=False, kPCD=1, use_fast_weights=False,
+                 sparse_target=0, sparse_damping=0, sparse_cost=0,
+                 collect_zero_signal=True, **kwargs):
         super(RBMLayer, self).__init__(init, name, parallelism)
+
+        self.persistant = persistant
+        self.kPCD = kPCD
+        self.use_fast_weights = use_fast_weights
+        self.sparse_target = sparse_target
+        self.sparse_damping = sparse_damping
+        self.sparse_cost = sparse_cost
+        self.collect_zero_signal = collect_zero_signal
+
         self.b_hidden = None
         self.b_visible = None
 
@@ -115,8 +134,8 @@ class RBMLayer(ParameterLayer):
         """
         Get layer parameters, gradients, and states for optimization
         """
-        return ((self.W, self.dW, self.b_hidden, self.db_hidden,
-                self.b_visible, self.db_visible), self.states)
+        return (((self.W, self.dW), (self.b_hidden, self.db_hidden),
+                (self.b_visible, self.db_visible)), self.states)
 
     def get_params_serialize(self, keep_states=True):
         """
@@ -152,21 +171,21 @@ class RBMLayer(ParameterLayer):
         self.b_visible = self.be.array(self.b_visible)
         self.db_visible = self.be.array(self.b_visible)
 
-    def fprop(self, inputs, inference=False, labels=None):
+    def fprop(self, inputs, inference=False, labels=None, weights=None):
         """
         forward propagation. Returns probability of hidden units
         """
-        hidden_proba_optree = self.hidden_probability(inputs)
+        hidden_proba_optree = self.hidden_probability(inputs, weights=weights)
         hidden_proba = self.be.empty(hidden_proba_optree.shape)
         hidden_proba._assign(hidden_proba_optree)
         return hidden_proba
 
-    def bprop(self, hidden_units, alpha=None, beta=None):
+    def bprop(self, hidden_units, alpha=None, beta=None, weights=None):
         """
         CD1 backward pass (negative phase)
         Returns probability of visible units
         """
-        visible_proba_optree = self.visible_probability(hidden_units)
+        visible_proba_optree = self.visible_probability(hidden_units, weights=weights)
         visible_proba = self.be.empty(visible_proba_optree.shape)
         visible_proba._assign(visible_proba_optree)
         return visible_proba
@@ -184,21 +203,13 @@ class RBMLayer(ParameterLayer):
         """
         return self.be.dot(visible_units, hidden_units.T)
 
-    def update(self, v_pos, labels=None, persistant=False, kPCD=1, use_fast_weights=False,
-               sparse_target=0, sparse_damping=0, sparse_cost=0, collect_zero_signal=True):
+    def update(self, v_pos, labels=None):
         """
         Calculate gradients
         Inputs:
             v_pos (Tensor): input units (typically given input sample X) of size (n_visibles, batch_size)
             labels (Tensor): either OHE labels of shape (n_classes, batch_size) or just labels of shape (1, batch_size).
                 In this case it will be converted to OHE labels.
-            persistant (bool): whether to use persistant CD
-            kPCD (int): number of samples generation during negative phase of CD (CD-k)
-            use_fast_weights (bool): whether to use fast weights CD algorithm for learning. Not implemented yet!
-            sparse_target (float): desired sparsity
-            sparse_damping (float): damping of sparsity parameters
-            sparse_cost (float): cost of not matching sparsity target
-            collect_zero_signal (bool): whether to use units with 0 signal during learning. Not supported.
         Returns:
             (update_W, update_b_hidden, update_b_visible) (tuple): gradients of W, b_hidden, b_visible
         """
@@ -206,15 +217,15 @@ class RBMLayer(ParameterLayer):
         h_pos = self.hidden_probability(v_pos)
 
         # negative phase
-        if persistant:
+        if self.persistant:
             if self.chain is None:
                 self.chain = self.be.zeros(h_pos.shape)
             chain = self.chain
         else:
             chain = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
-        for k in xrange(kPCD):
-            if persistant:
+        for k in xrange(self.kPCD):
+            if self.persistant:
                 v_neg = self.sample_visibles(chain)
             else:
                 v_neg = self.visible_probability(chain)
@@ -223,21 +234,18 @@ class RBMLayer(ParameterLayer):
             chain = h_neg > self.be.array(self.be.rng.uniform(size=h_neg.shape))
 
         # calculate chain explicitly
-        if persistant:
+        if self.persistant:
             self.chain._assign(chain)
 
-
-        if not collect_zero_signal:
+        if not self.collect_zero_signal:
             zero_signal_mask = self.hidden_preacts.get() == 0
 
-            h_pos[zero_signal_mask] = sparse_target
-            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos, sparse_target,
-                                                                  sparse_damping, sparse_cost)
+            h_pos[zero_signal_mask] = self.sparse_target
+            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos)
             h_pos[zero_signal_mask] = 0
             h_neg[zero_signal_mask] = 0
         else:
-            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos, sparse_target,
-                                                                  sparse_damping, sparse_cost)
+            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos)
 
         # update_W = self.be.dot(v_pos, h_pos.T) - self.be.dot(v_neg, h_neg.T)
         update_W = self._grad(v_pos, h_pos) - self._grad(v_neg, h_neg)
@@ -247,7 +255,7 @@ class RBMLayer(ParameterLayer):
         result = {'W': update_W / float(self.be.bsz),
                   'b_hidden': update_b_hidden,
                   'b_visible': update_b_visible}
-        if not collect_zero_signal:
+        if not self.collect_zero_signal:
             result['zero_signal_mask'] = zero_signal_mask
         return result
 
@@ -287,18 +295,18 @@ class RBMLayer(ParameterLayer):
         v_probability = self.visible_probability(hidden_units)
         return v_probability > self.be.array(self.be.rng.uniform(size=v_probability.shape))
 
-    def get_sparse_grads_b_hidden(self, h_proba, sparse_target=0, sparse_damping=0, sparse_cost=0):
-        if sparse_cost == 0:
+    def get_sparse_grads_b_hidden(self, h_proba):
+        if self.sparse_cost == 0:
             return self.be.zeros_like(self.b_hidden)
 
         if not hasattr(self, 'hidmeans'):
             self.hidmeans = self.be.empty((self.n_hidden, 1))
-            self.hidmeans[:] = sparse_target * self.be.ones((self.n_hidden, 1))
+            self.hidmeans[:] = self.sparse_target * self.be.ones((self.n_hidden, 1))
 
         hidden_probability_mean = self.be.mean(h_proba, axis=-1)
-        self.hidmeans[:] = sparse_damping * self.hidmeans + (1 - sparse_damping) * hidden_probability_mean
+        self.hidmeans[:] = self.sparse_damping * self.hidmeans + (1 - self.sparse_damping) * hidden_probability_mean
 
-        sparsegrads_b_hidden = sparse_cost * (self.hidmeans - sparse_target)
+        sparsegrads_b_hidden = self.sparse_cost * (self.hidmeans - self.sparse_target)
         return sparsegrads_b_hidden
 
     def free_energy(self, inputs):
@@ -351,8 +359,14 @@ class RBMLayerWithLabels(RBMLayer):
 
     """
 
-    def __init__(self, n_hidden, n_classes, n_duplicates=1, init=None, name="RBMLayerWithLabels"):
-        super(RBMLayerWithLabels, self).__init__(n_hidden, init=init, name=name)
+    def __init__(self, n_hidden, n_classes, n_duplicates=1, init=None, name="RBMLayerWithLabels",
+                 persistant=False, kPCD=1, use_fast_weights=False,
+                 sparse_target=0, sparse_damping=0, sparse_cost=0,
+                 collect_zero_signal=True):
+        super(RBMLayerWithLabels, self).__init__(n_hidden, init=init, name=name, persistant=persistant, kPCD=kPCD,
+                                                 use_fast_weights=use_fast_weights, sparse_target=sparse_target,
+                                                 sparse_cost=sparse_cost, sparse_damping=sparse_damping,
+                                                 collect_zero_signal=collect_zero_signal)
         self.n_classes = n_classes
         self.n_duplicates = n_duplicates
 
@@ -360,8 +374,9 @@ class RBMLayerWithLabels(RBMLayer):
         self.fast_b_hidden = 0
         self.fast_b_visible = 0
 
-    def allocate_fast_weights(self, use_fast_weights):
-        if use_fast_weights:
+    def allocate(self, shared_outputs=None):
+        super(RBMLayerWithLabels, self).allocate(shared_outputs)
+        if self.use_fast_weights:
             self.fast_W = self.be.zeros(self.weight_shape)
             self.fast_dW = self.be.zeros(self.weight_shape)
             self.fast_b_hidden = self.be.zeros(self.b_hid_shape)
@@ -380,7 +395,7 @@ class RBMLayerWithLabels(RBMLayer):
         self.b_vis_shape = (self.b_vis_shape[0] + self.n_classes, self.b_vis_shape[1])
         return self
 
-    def fprop(self, inputs, inference=False, labels=None):
+    def fprop(self, inputs, inference=False, labels=None, weights=None):
         """
         Calculate hidden units
         """
@@ -391,13 +406,24 @@ class RBMLayerWithLabels(RBMLayer):
 
         v_units = self.be.array(np.vstack((ohe_labels, inputs.get())))
 
-        return super(RBMLayerWithLabels, self).fprop(v_units)
+        return super(RBMLayerWithLabels, self).fprop(v_units, inference=inference, weights=weights)
 
-    def hidden_probability(self, inputs, labels=None, fast_weights=0, fast_b_hidden=0):
+    def bprop(self, hidden_units, alpha=None, beta=None, weights=None):
+        """
+        CD1 backward pass (negative phase)
+        Returns probability of visible units
+        """
+        visible_proba = super(RBMLayerWithLabels, self).bprop(hidden_units, alpha, beta, weights)
+        return visible_proba[self.n_classes:]
+
+    def hidden_probability(self, inputs, labels=None, fast_weights=0, fast_b_hidden=0, weights=None):
         """
         Calculate P(h | v)
         """
-        weights = _calc_optree(self.W + fast_weights, self.be)
+        if weights is None:
+            weights = self.W
+
+        weights = _calc_optree(weights + fast_weights, self.be)
 
         v_units = inputs
         if inputs.shape[0] != self.W.shape[0]:
@@ -414,11 +440,13 @@ class RBMLayerWithLabels(RBMLayer):
         hidden_proba = self.sigmoid(hidden_preacts)
         return hidden_proba
 
-    def visible_probability(self, hidden_units, fast_weights=0, fast_b_visible=0):
+    def visible_probability(self, hidden_units, fast_weights=0, fast_b_visible=0, weights=None):
         """
         Calculate P(v|h)
         """
-        weights = self.W + fast_weights
+        if weights is None:
+            weights = self.W
+        weights = weights + fast_weights
         visible_preacts = _calc_optree(self.be.dot(weights, hidden_units) + self.b_visible + fast_b_visible,
                                        self.be)
         visible_probability = self.be.empty_like(visible_preacts)
@@ -456,21 +484,13 @@ class RBMLayerWithLabels(RBMLayer):
                 v_units_tensor.get()[i] = (random_numbers >= probabilities[i - 1]) & (random_numbers < probabilities[i])
         return v_units_tensor
 
-    def update(self, v_pos, labels=None, persistant=False, kPCD=1, use_fast_weights=False,
-               sparse_target=0, sparse_damping=0, sparse_cost=0, collect_zero_signal=True):
+    def update(self, v_pos, labels=None):
         """
         Calculate gradients
         Inputs:
             v_pos (Tensor): input units (typically given input sample X) of size (n_visibles, batch_size)
             labels (Tensor): either OHE labels of shape (n_classes, batch_size) or just labels of shape (1, batch_size).
                 In this case it will be converted to OHE labels.
-            persistant (bool): whether to use persistant CD
-            kPCD (int): number of samples generation during negative phase of CD (CD-k)
-            use_fast_weights (bool): whether to use fast weights CD algorithm for learning.
-            sparse_target (float): desired sparsity
-            sparse_damping (float): damping of sparsity parameters
-            sparse_cost (float): cost of not matching sparsity target
-            collect_zero_signal (bool): whether to use units with 0 signal during learning. Not supported.
         Returns:
             (update_W, update_b_hidden, update_b_visible) (tuple): gradients of W, b_hidden, b_visible
         """
@@ -482,26 +502,21 @@ class RBMLayerWithLabels(RBMLayer):
         v_pos = _calc_optree(v_pos, self.be)
         v_pos_with_labels = self.be.array(np.vstack((ohe_labels, v_pos.get())))
 
-        # positive phase
-        if self.fast_W is None:
-            self.allocate_fast_weights(use_fast_weights)
-
         h_pos = self.hidden_probability(v_pos_with_labels)
 
         # sparsity
-        sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos, sparse_target,
-                                                              sparse_damping, sparse_cost)
+        sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos)
 
         # negative phase
-        if persistant:
+        if self.persistant:
             if self.chain is None:
                 self.chain = self.be.zeros(h_pos.shape)
             chain = self.chain
         else:
             chain = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
-        for k in xrange(kPCD):
-            if persistant:
+        for k in xrange(self.kPCD):
+            if self.persistant:
                 v_neg = self.sample_visibles(chain, self.fast_W, self.fast_b_visible)
             else:
                 v_neg = self.visible_probability(chain, self.fast_W, self.fast_b_visible)
@@ -510,7 +525,7 @@ class RBMLayerWithLabels(RBMLayer):
 
             chain = h_neg > self.be.array(self.be.rng.uniform(size=h_neg.shape))
 
-        if persistant:
+        if self.persistant:
             self.chain = _calc_optree(chain, self.be)
 
         update_W = self._grad(v_pos_with_labels, h_pos) - self._grad(v_neg, h_neg)
@@ -521,7 +536,6 @@ class RBMLayerWithLabels(RBMLayer):
                   'b_hidden': update_b_hidden,
                   'b_visible': update_b_visible}
         return result
-
 
     def update_for_wake_sleep(self, v_pos, labels=None, persistant=False, kPCD=1):
         """
@@ -602,8 +616,14 @@ class ConvolutionalRBMLayer(RBMLayer):
         name (Optional[str]): layer name. Defaults to "ConvolutionLayer"
     """
 
-    def __init__(self, fshape, strides={}, padding={}, init=None, bsum=False, name="ConvolutionalRBMLayer", parallelism="Data"):
-        super(ConvolutionalRBMLayer, self).__init__(0, init=init, name=name, parallelism=parallelism)
+    def __init__(self, fshape, strides={}, padding={}, init=None, bsum=False, name="ConvolutionalRBMLayer", parallelism="Data",
+                 persistant=False, kPCD=1, use_fast_weights=False,
+                 sparse_target=0, sparse_damping=0, sparse_cost=0,
+                 collect_zero_signal=True):
+        super(ConvolutionalRBMLayer, self).__init__(0, init=init, name=name, parallelism=parallelism, persistant=persistant, kPCD=kPCD,
+                                                    use_fast_weights=use_fast_weights, sparse_target=sparse_target,
+                                                    sparse_cost=sparse_cost, sparse_damping=sparse_damping,
+                                                    collect_zero_signal=collect_zero_signal)
 
         self.nglayer = None
         self.convparams = {'str_h': 1, 'str_w': 1, 'str_d': 1,
@@ -652,69 +672,6 @@ class ConvolutionalRBMLayer(RBMLayer):
 
         return self
 
-    # def init_buffers(self, inputs):
-    #     """
-    #     Helper for allocating output and delta buffers (but not initializing
-    #     them)
-
-    #     Arguments:
-    #         inputs (Tensor): tensor used for frop inputs, used to determine
-    #             shape of buffers being allocated.
-    #     """
-    #     self.inputs = inputs
-    #     if not self.nglayer:
-    #         assert hasattr(self.inputs, 'lshape')
-    #         self.n_visible = reduce(mul, self.inputs.lshape[:4])
-    #         self.convparams['C'] = self.inputs.lshape[0] # n_input_feature_maps
-    #         self.convparams['D'] = self.inputs.lshape[1] # depth of image
-    #         self.convparams['H'] = self.inputs.lshape[2] # height of image
-    #         self.convparams['W'] = self.inputs.lshape[3] # width of image
-    #         self.convparams['N'] = self.be.bsz # n_images in mini-batch
-    #         self.nglayer = self.be.conv_layer(self.be.default_dtype, **self.convparams)
-    #         self.hidden_preacts = self.be.iobuf(self.nglayer.nOut, self.hidden_preacts)
-    #         self.hidden_preacts.lshape = (self.nglayer.K, self.nglayer.M, self.nglayer.P, self.nglayer.Q)
-    #         # self.deltas = self.be.iobuf(self.inputs.shape[0], self.deltas)
-
-    #     if not self.nglayer_deconv:
-    #         # deconv layer for convolving H and W_flipped (to obtain V in negative phase)
-    #         self.deconvparams = self.convparams.copy()
-    #         del self.deconvparams['D']
-    #         del self.deconvparams['H']
-    #         del self.deconvparams['W']
-    #         self.deconvparams['C'] = 1 # self.convparams['K']
-    #         self.deconvparams['K'] = 1 # self.convparams['C']
-    #         self.deconvparams['M'] = self.nglayer.M
-    #         self.deconvparams['P'] = self.nglayer.P
-    #         self.deconvparams['Q'] = self.nglayer.Q
-    #         self.nglayer_deconv = self.be.deconv_layer(self.be.default_dtype, **self.deconvparams)
-    #         self.visible_preacts = self.be.iobuf(self.nglayer_deconv.nOut, self.visible_preacts)
-    #         self.visible_preacts.lshape = (self.nglayer_deconv.C, self.nglayer_deconv.D,
-    #                                        self.nglayer_deconv.H, self.nglayer_deconv.W)
-
-    #     # conv layer and params for convolving V and P(H|V)
-    #     if not self.nglayer_grad_W:
-    #         self.convparams_grad_W = self.convparams.copy()
-    #         self.convparams_grad_W['N'] = self.be.bsz
-    #         self.convparams_grad_W['T'] = self.nglayer.M # depth of filter
-    #         self.convparams_grad_W['R'] = self.nglayer.P # height of filter
-    #         self.convparams_grad_W['S'] = self.nglayer.Q # width of filter
-    #         self.nglayer_grad_W = ConvLayerGrad(self.be, self.be.default_dtype, **self.convparams_grad_W)
-    #         # self.visible_preacts = None
-    #         # self.visible_preacts = self.be.iobuf(self.nglayer_grad_W.nOut, self.visible_preacts)
-
-    #     if self.weight_shape is None:
-    #         self.weight_shape = self.nglayer.dimF2  # (C * T * R * S, K)
-
-    #     # bias for visible units
-    #     if not hasattr(self, 'b_vis_shape') or (hasattr(self, 'b_vis_shape') and self.b_vis_shape is None):
-    #         # c in Matlab code
-    #         self.b_vis_shape = (reduce(mul, self.inputs.lshape[1:4]), 1)
-
-    #     # bias for hidden units
-    #     if not hasattr(self, 'b_hid_shape') or (hasattr(self, 'b_hid_shape') and self.b_hid_shape is None):
-    #         # b in Matlab code
-    #         self.b_hid_shape = (self.convparams['K'], 1) # K x 1 x 1 x 1 - number of output feature maps
-
     def _grad(self, visible_units, hidden_units):
         """
         Calculate positive part of grad_W
@@ -745,19 +702,13 @@ class ConvolutionalRBMLayer(RBMLayer):
 
     #     return self.be.array(np.squeeze(intermediate_mean.get()).reshape(-1, 1) / self.be.bsz)
 
-    def update(self, v_pos, labels=None, persistant=False, kPCD=1, use_fast_weights=False,
-               sparse_target=0, sparse_damping=0, sparse_cost=0, collect_zero_signal=True):
+    def update(self, v_pos, labels=None):
         """
         Calculate gradients
+
         Inputs:
             v_pos (Tensor): input units (typically given input sample X) of shape (n_visibles, batch_size)
-            persistant (bool): whether to use persistant CD
-            kPCD (int): number of samples generation during negative phase of CD (CD-k)
-            use_fast_weights (bool): whether to use fast weights CD algorithm for learning. Not implemented yet!
-            sparse_target (float): desired sparsity
-            sparse_damping (float): damping of sparsity parameters
-            sparse_cost (float): cost of not matching sparsity target
-            collect_zero_signal (bool): whether to use units with 0 signal during learning
+
         Returns:
             (update_W, update_b_hidden, update_b_visible, zeros_ratio) (tuple): gradients of W, b_hidden, b_visible, zeros_ratio
                 zeros_ratio (float) is n_hidden_units / (n_hidden_units - n_zero)
@@ -766,15 +717,15 @@ class ConvolutionalRBMLayer(RBMLayer):
         h_pos = self.hidden_probability(v_pos)
 
         # negative phase
-        if persistant:
+        if self.persistant:
             if self.chain is None:
                 self.chain = self.be.zeros(h_pos.shape)
             chain = self.chain
         else:
             chain = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
-        for k in xrange(kPCD):
-            if persistant:
+        for k in xrange(self.kPCD):
+            if self.persistant:
                 v_neg = self.sample_visibles(chain)
             else:
                 v_neg = self.visible_probability(chain)
@@ -782,21 +733,19 @@ class ConvolutionalRBMLayer(RBMLayer):
             h_neg = self.hidden_probability(v_neg)
             chain = h_neg > self.be.array(self.be.rng.uniform(size=h_neg.shape))
 
-        if persistant:
+        if self.persistant:
             self.chain._assign(chain)
 
-        if not collect_zero_signal:
+        if not self.collect_zero_signal:
             zero_signal_mask = self.hidden_preacts.get() == 0
 
             h_pos[zero_signal_mask] = sparse_target
-            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos, sparse_target,
-                                                                  sparse_damping, sparse_cost)
+            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos)
             h_pos[zero_signal_mask] = 0
             h_neg[zero_signal_mask] = 0
             zeros_ratio = zero_signal_mask.size / (zero_signal_mask.size - np.sum(zero_signal_mask))
         else:
-            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos, sparse_target,
-                                                                  sparse_damping, sparse_cost)
+            sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos)
             zeros_ratio = 1
 
         update_W = self._grad(v_pos, h_pos) - self._grad(v_neg, h_neg)
@@ -857,18 +806,18 @@ class ConvolutionalRBMLayer(RBMLayer):
         visible_proba = self.sigmoid(visible_preacts)
         return visible_proba
 
-    def get_sparse_grads_b_hidden(self, h_probability, sparse_target=1, sparse_damping=0, sparse_cost=1):
-        if sparse_cost == 0:
+    def get_sparse_grads_b_hidden(self, h_probability):
+        if self.sparse_cost == 0:
             return self.be.zeros_like(self.b_hidden)
 
         if not hasattr(self, 'hidmeans'):
-            self.hidmeans = self.be.ones(self.nglayer.dimO[:-1]) * sparse_target
+            self.hidmeans = self.be.ones(self.nglayer.dimO[:-1]) * self.sparse_target
 
         h_probability = h_probability.reshape(self.nglayer.dimO)
         hidden_probability_mean = self.be.empty(self.hidmeans.shape + (1,))
         hidden_probability_mean[:] = self.be.mean(h_probability, axis=-1)
-        self.hidmeans[:] = sparse_damping * self.hidmeans + (1 - sparse_damping) * hidden_probability_mean[:, :, :, 0]
+        self.hidmeans[:] = self.sparse_damping * self.hidmeans + (1 - self.sparse_damping) * hidden_probability_mean[:, :, :, 0]
 
-        sparsegrads_b_hidden = sparse_cost * np.squeeze(np.mean(np.mean(np.mean(self.hidmeans.get() - sparse_target,
+        sparsegrads_b_hidden = sparse_cost * np.squeeze(np.mean(np.mean(np.mean(self.hidmeans.get() - self.sparse_target,
                                                                  axis=1), axis=1), axis=1))
         return self.be.array(sparsegrads_b_hidden.reshape(-1, 1))

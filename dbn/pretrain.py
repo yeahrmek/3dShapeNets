@@ -28,6 +28,7 @@ be = gen_backend(backend='cpu',
 data = ModelNetDataset(path, classes=classes, data_size=30, lshape=(1, 30, 30, 30))
 
 # train first layer
+optimizers = [GradientDescentMomentum(learning_rate=0.01, momentum_coef=[0.5, 0.9], wdecay=1e-5)]
 parameters = {'momentum': [0,5, 0.9],
               'step_config': 0.25,
               'learning_rate': 0.01,
@@ -44,16 +45,19 @@ n_epochs = 1
 init = GlorotUniform()
 
 # it seems that the data have shape 30x30x30, though I think it should be 24 with padding=2
-layers = [RBMConvolution3D([6, 6, 6, 48], strides=2, padding=0, init=init),
-          RBMConvolution3D([5, 5, 5, 160], strides=2, padding=0, init=init),
-          RBMConvolution3D([4, 4, 4, 512], strides=2, padding=0, init=init),
-          RBMLayer(1200, init=init),
-          RBMLayerWithLabels(4000, n_classes)]
+layers = [RBMConvolution3D([6, 6, 6, 48], strides=2, padding=0, init=init, name='l1_conv'),
+          RBMConvolution3D([5, 5, 5, 160], strides=2, padding=0, init=init, name='l2_conv'),
+          RBMConvolution3D([4, 4, 4, 512], strides=2, padding=0, init=init, name='l3_conv'),
+          RBMLayer(1200, init=init, name='l4_rbm'),
+          RBMLayerWithLabels(4000, n_classes, name='l4_rbm_with_labels')]
+
+
 
 
 rbm = RBM(layers=layers)
 
-callbacks = Callbacks(rbm, data, output_file='./output.hdf5')
+# callbacks = Callbacks(rbm, data, output_file='./output.hdf5')
+ callbacks = Callbacks(rbm, data)
 
 
 t = time.time()
