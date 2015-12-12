@@ -190,7 +190,7 @@ class RBMLayer(ParameterLayer):
         visible_proba._assign(visible_proba_optree)
         return visible_proba
 
-    def _grad(self, visible_units, hidden_units):
+    def _grad_W(self, visible_units, hidden_units):
         """
         Calculate positive or negative gradient of weights
 
@@ -202,6 +202,18 @@ class RBMLayer(ParameterLayer):
             OPTree.node
         """
         return self.be.dot(visible_units, hidden_units.T)
+
+    def _grad_b_hidden(self, h_pos, h_neg):
+        """
+        Gradient of b_hidden
+        """
+        return self.be.sum(h_pos - h_neg, axis=-1)
+
+    def _grad_b_visible(self, v_pos, v_neg):
+        """
+        Gradient of b_visible
+        """
+        return self.be.sum(v_pos - v_neg, axis=-1)
 
     def update(self, v_pos, labels=None):
         """
@@ -247,17 +259,9 @@ class RBMLayer(ParameterLayer):
         else:
             sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos)
 
-        # update_W = self.be.dot(v_pos, h_pos.T) - self.be.dot(v_neg, h_neg.T)
-        update_W = self._grad(v_pos, h_pos) - self._grad(v_neg, h_neg)
-        update_b_visible = self.be.mean(v_pos - v_neg, axis=-1)
-        update_b_hidden = self.be.mean(h_pos - h_neg, axis=-1) - sparsegrads_b_hidden
-
-        result = {'W': update_W / float(self.be.bsz),
-                  'b_hidden': update_b_hidden,
-                  'b_visible': update_b_visible}
-        if not self.collect_zero_signal:
-            result['zero_signal_mask'] = zero_signal_mask
-        return result
+        self.dW[:] = -(self._grad_W(v_pos, h_pos) - self._grad_W(v_neg, h_neg))
+        self.db_visible[:] = -self._grad_b_visible(v_pos, v_neg)
+        self.db_hidden[:] = -(self._grad_b_hidden(h_pos, h_neg) - sparsegrads_b_hidden)
 
     def hidden_probability(self, inputs, labels=None, weights=None):
         """
@@ -266,8 +270,8 @@ class RBMLayer(ParameterLayer):
         if weights is None:
             weights = self.W
 
-        hidden_preacts = self.be.dot(weights.T, inputs)
-        hidden_proba = self.sigmoid(hidden_preacts + self.b_hidden)
+        hidden_preacts = self.be.dot(weights.T, inputs) + self.b_hidden
+        hidden_proba = self.sigmoid(hidden_preacts)
         return hidden_proba
 
     def visible_probability(self, hidden_units, weights=None):
@@ -373,16 +377,19 @@ class RBMLayerWithLabels(RBMLayer):
         self.fast_W = None
         self.fast_b_hidden = 0
         self.fast_b_visible = 0
+        self.fast_states = []
 
     def allocate(self, shared_outputs=None):
         super(RBMLayerWithLabels, self).allocate(shared_outputs)
+
+        parallel, distributed = self.get_param_attrs()
         if self.use_fast_weights:
-            self.fast_W = self.be.zeros(self.weight_shape)
-            self.fast_dW = self.be.zeros(self.weight_shape)
-            self.fast_b_hidden = self.be.zeros(self.b_hid_shape)
-            self.fast_db_hidden = self.be.zeros(self.b_hid_shape)
-            self.fast_b_visible = self.be.zeros(self.b_vis_shape)
-            self.fast_db_visible = self.be.zeros(self.b_vis_shape)
+            self.fast_W = self.be.zeros(self.weight_shape, parallel=parallel, distributed=distributed)
+            self.fast_dW = self.be.zeros_like(self.fast_W)
+            self.fast_b_hidden = self.be.zeros(self.b_hid_shape, parallel=parallel, distributed=distributed)
+            self.fast_db_hidden = self.be.zeros_like(self.fast_b_hidden)
+            self.fast_b_visible = self.be.zeros(self.b_vis_shape, parallel=parallel, distributed=distributed)
+            self.fast_db_visible = self.be.zeros_like(self.fast_b_visible)
         else:
             self.fast_W = 0
             self.fast_b_hidden = 0
@@ -528,14 +535,9 @@ class RBMLayerWithLabels(RBMLayer):
         if self.persistant:
             self.chain = _calc_optree(chain, self.be)
 
-        update_W = self._grad(v_pos_with_labels, h_pos) - self._grad(v_neg, h_neg)
-        update_b_visible = self.be.mean(v_pos_with_labels - v_neg, axis=-1)
-        update_b_hidden = self.be.mean(h_pos - h_neg, axis=-1) - sparsegrads_b_hidden
-
-        result = {'W': update_W / float(self.be.bsz),
-                  'b_hidden': update_b_hidden,
-                  'b_visible': update_b_visible}
-        return result
+        self.dW[:] = -(self._grad_W(v_pos_with_labels, h_pos) - self._grad_W(v_neg, h_neg))
+        self.db_visible[:] = -(self._grad_b_visible(v_pos_with_labels, v_neg))
+        self.db_hidden[:] = -(self._grad_b_hidden(h_pos, h_neg) - sparsegrads_b_hidden)
 
     def update_for_wake_sleep(self, v_pos, labels=None, persistant=False, kPCD=1):
         """
@@ -543,7 +545,11 @@ class RBMLayerWithLabels(RBMLayer):
         """
 
         # positive phase
-        h_pos = self.hidden_probability(v_pos, labels)
+        ohe_labels = label2binary(labels, self.n_classes)
+        v_pos = _calc_optree(v_pos, self.be)
+        v_pos_with_labels = self.be.array(np.vstack((ohe_labels, v_pos.get())))
+
+        h_pos = self.hidden_probability(v_pos_with_labels)
         h_pos_sample = h_pos > self.be.array(self.be.rng.uniform(size=h_pos.shape))
 
         # negative phase
@@ -568,8 +574,8 @@ class RBMLayerWithLabels(RBMLayer):
         if persistant:
             self.chain = _calc_optree(chain, self.be)
 
-        update_W = self._grad(v_pos, h_pos_sample) - self._grad(v_neg_sample, h_neg)
-        update_b_visible = self.be.mean(v_pos - v_neg_sample, axis=-1)
+        update_W = self._grad_W(v_pos_with_labels, h_pos_sample) - self._grad_W(v_neg_sample, h_neg)
+        update_b_visible = self.be.mean(v_pos_with_labels - v_neg_sample, axis=-1)
         update_b_hidden = self.be.mean(h_pos_sample - h_neg, axis=-1)
 
         return update_W / float(self.be.bsz), update_b_hidden, update_b_visible, v_neg, v_neg_sample, h_neg
@@ -672,7 +678,7 @@ class ConvolutionalRBMLayer(RBMLayer):
 
         return self
 
-    def _grad(self, visible_units, hidden_units):
+    def _grad_W(self, visible_units, hidden_units):
         """
         Calculate positive part of grad_W
 
@@ -685,7 +691,21 @@ class ConvolutionalRBMLayer(RBMLayer):
         hidden_units_tensor = _calc_optree(hidden_units, self.be)
         self.be.update_conv(self.nglayer, visible_units_tensor, hidden_units_tensor, result)
         # TODO: check that division by the batch size is needed. It maybe not because of self.batch_sum
-        return result / self.be.bsz
+        return result
+
+    def _grad_b_hidden(self, h_pos, h_neg):
+        """
+        Gradient of b_hidden
+        """
+        update_b_hidden = _calc_optree(self.be.mean(h_pos - h_neg, axis=-1), self.be)
+        update_b_hidden = self.be.sum(update_b_hidden.reshape(self.convparams['K'], -1), axis=-1)
+        return update_b_hidden
+
+    def _grad_b_visible(self, v_pos, v_neg):
+        """
+        Gradient of b_visible
+        """
+        return self.be.sum(v_pos - v_neg, axis=-1)
 
     # def _complex_mean(self, input_array, mean_axes):
     #     """
@@ -748,19 +768,10 @@ class ConvolutionalRBMLayer(RBMLayer):
             sparsegrads_b_hidden = self.get_sparse_grads_b_hidden(h_pos)
             zeros_ratio = 1
 
-        update_W = self._grad(v_pos, h_pos) - self._grad(v_neg, h_neg)
-        update_b_visible = self.be.mean(v_pos - v_neg, axis=-1)
-
+        self.dW[:] = -(self._grad_W(v_pos, h_pos) - self._grad_W(v_neg, h_neg))
+        self.db_visible[:] = -self._grad_b_visible(v_pos, v_neg)
         #TODO: maybe this should be mean(mean(mean(...))) like in crbm.m?
-        update_b_hidden = _calc_optree(self.be.mean(h_pos - h_neg, axis=-1), self.be)
-        update_b_hidden = self.be.sum(update_b_hidden.reshape(self.convparams['K'], -1), axis=-1)
-        update_b_hidden -= sparsegrads_b_hidden
-
-        result = {'W': update_W / float(self.be.bsz),
-                  'b_hidden': update_b_hidden,
-                  'b_visible': update_b_visible,
-                  'zeros_ratio': zeros_ratio}
-        return result
+        self.db_hidden[:] = -(self._grad_b_hidden(h_pos, h_neg) - sparsegrads_b_hidden)
 
     def hidden_probability(self, inputs, weights=None):
         """
