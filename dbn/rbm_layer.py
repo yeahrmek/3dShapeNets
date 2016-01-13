@@ -169,7 +169,7 @@ class RBMLayer(ParameterLayer):
         self.db_hidden = self.be.empty_like(self.b_hidden)
 
         self.b_visible = self.be.array(self.b_visible)
-        self.db_visible = self.be.array(self.b_visible)
+        self.db_visible = self.be.empty_like(self.b_visible)
 
     def fprop(self, inputs, inference=False, labels=None, weights=None):
         """

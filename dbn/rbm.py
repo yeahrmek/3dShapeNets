@@ -105,14 +105,15 @@ class RBM(Model):
         """
         epoch = self.epoch_index
 
+        layer = self.layers.layers_to_optimize[self.layer_being_trained]
+        self.optimizer.map_list = None
+
         # iterate through minibatches of the dataset
         for mb_idx, (x, t) in enumerate(dataset):
 
             callbacks.on_minibatch_begin(epoch, mb_idx)
 
             x = self.fprop(x, labels=t, fprop_to_layer=self.layer_being_trained)
-
-            layer = self.layers.layers_to_optimize[self.layer_being_trained]
 
             layer.update(x, labels=t)
 
